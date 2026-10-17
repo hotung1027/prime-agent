@@ -57,6 +57,14 @@ Rules:
 
 ## Aliases
 
+Equivalent phase prefixes - all three spellings resolve to the same (point, timing):
+
+```
+pre<point>   before_<point>   pre_<point>       -> before
+post<point>  after_<point>    post_<point>      -> after
+during<point> wrap_<point>    during_<point>    -> wrap
+```
+
 ```
 before_<point>   after_<point>   wrap_<point>          # canonical shorthand
 before_agent after_agent before_model after_model wrap_model_call

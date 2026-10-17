@@ -38,6 +38,15 @@ try:
     bus.on("tool", timing="after_") if False else bus.on("commit", timing="wrap")(lambda e, n: n())
     check("unsupported timing refused", False)
 except ValueError as e: check("unsupported timing refused", "does not support" in str(e))
+# phase-prefix equivalence: pre-/before- = before, post-/after- = after, wrap-/during- = wrap
+for alias, expected in (("pre_tool", ("tool", "before")), ("before_tool", ("tool", "before")),
+                        ("post_tool", ("tool", "after")), ("after_tool", ("tool", "after")),
+                        ("during_tool", ("tool", "wrap")), ("wrap_tool", ("tool", "wrap")),
+                        ("preModel", ("model", "before")), ("postCommit", ("commit", "after")),
+                        ("preToolUse", ("tool", "before")), ("postToolUse", ("tool", "after")),
+                        ("duringModel", ("model", "wrap"))):
+    check(f"{alias} -> {expected[0]}/{expected[1]}", ev.resolve(alias) == expected, str(ev.resolve(alias)))
+
 # anchors: every point states what its phase is relative to
 missing = [p for p, sp in ev.CATALOG.items() if not sp.anchor]
 check("every point declares an anchor", not missing, str(missing))

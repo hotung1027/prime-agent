@@ -120,7 +120,15 @@ for _point, _anchor in ANCHORS.items():
     if _point in CATALOG:
         CATALOG[_point] = replace(CATALOG[_point], anchor=_anchor)
 
-PREFIXES = {"before_": "before", "after_": "after", "wrap_": "wrap"}
+# pre-/before- = before, post-/after- = after, wrap-/during- = wrap. Longest first so "before_"
+# wins over "before".
+PHASE_PREFIXES = (
+    ("before_", "before"), ("after_", "after"), ("wrap_", "wrap"),
+    ("pre_", "before"), ("post_", "after"), ("during_", "wrap"),
+    ("before", "before"), ("after", "after"), ("pre", "before"),
+    ("post", "after"), ("wrap", "wrap"), ("during", "wrap"),
+)
+PREFIXES = dict(PHASE_PREFIXES)
 # alias -> (point, timing): the names in each spec string are listed in the same order as timings.
 ALIASES: dict[str, tuple[str, str]] = {}
 for _spec in CATALOG.values():
@@ -151,11 +159,15 @@ def resolve(name: str, timing: str | None = None, scope: str = "both") -> tuple[
             if name.endswith(suffix) and name[:-len(suffix)] in CATALOG:
                 point, timing = name[:-len(suffix)], timing or kind
                 break
-        for prefix, kind in PREFIXES.items():
-            rest = name[len(prefix):] if name.startswith(prefix) else ""
-            if rest in CATALOG:
-                point, timing = rest, timing or kind
-                break
+        if point is None:
+            low = name.lower()
+            for prefix, kind in PHASE_PREFIXES:          # longest first
+                if not low.startswith(prefix):
+                    continue
+                rest = name[len(prefix):].lower()
+                if rest in CATALOG:
+                    point, timing = rest, timing or kind
+                    break
     spec = CATALOG.get(point) if point else None
     if spec is None:
         raise ValueError(f"unknown event {name!r}; known points: {sorted(CATALOG)} (or cron:<name>)")
