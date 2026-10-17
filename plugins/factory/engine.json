@@ -1,0 +1,55 @@
+{
+ "hooks": {
+  "run_end": [
+   {
+    "type": "shell",
+    "command": "python3 \"$HOME/.prime/agent/pipelines/obsidian_sync.py\" --quiet"
+   }
+  ]
+ },
+ "docs_stages": [
+  "staging",
+  "prod"
+ ],
+ "_hook_events": [
+  "run_start",
+  "researched",
+  "planned",
+  "implemented",
+  "file_changed",
+  "reviewed",
+  "verified",
+  "gate",
+  "documented",
+  "merged",
+  "run_end",
+  "failure"
+ ],
+ "_hook_examples": {
+  "implemented": [
+   {
+    "type": "shell",
+    "command": "git add -A && git commit -m 'pipeline: {task_title}' || true"
+   }
+  ],
+  "merged": [
+   {
+    "type": "shell",
+    "command": "git push"
+   },
+   {
+    "type": "mcp",
+    "server": "linear",
+    "tool": "create_comment",
+    "arguments": {
+     "issueId": "{linear_id}",
+     "body": "Delivered: {task_title}"
+    }
+   }
+  ]
+ },
+ "notes": {
+  "models": "Per-role chains chosen on 2026-10-14 by: available on this account AND benchmark-backed AND output < $1/Mtok. Benchmarks: CritPt (scientific), SciCode + Terminal-Bench 4.0 (coding/agentic), GPQA (reasoning/analysis), HLE (planning), LCR (long context), MMMU-Pro (vision). Scores from artificialanalysis.ai model payload; Terminal-Bench from tbench.ai leaderboard. Exception: visual keeps deepseek-v4.1-flash ($1.20 out, MMMU-Pro 77.0) - no vision model under $1 has a published score. qwen is excluded by user preference.",
+  "tiers": "Two tiers by the user's rule: QUALITY roles (planner, reviewer, verifier, security, profiling, scientific research) run mimo-v2.6-pro / glm-5.3-flash; SPEED roles (implementer, documentator, cicd, infrastructure, visual, web lookups) run deepseek-v4.1-flash (~70 tps measured vs ~33/30). Batch ':batch' model ids are NOT usable: they 404 on /chat/completions (DeepInfraBatchAdapter) and are excluded from the cache."
+ }
+}
