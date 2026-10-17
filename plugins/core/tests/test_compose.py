@@ -3,6 +3,7 @@ import asyncio, sys
 from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent / "core"))
+sys.path.insert(0, str(HERE.parent.parent / "trace"))
 sys.path.insert(0, str(HERE.parent))
 import bus, middleware
 
@@ -13,11 +14,11 @@ def check(name, cond, detail=""):
 async def main():
     # 1. timing order: before asc, wrap, after desc
     bus.reset(); order = []
-    bus.on("tool", timing="before", priority=20)(lambda e: order.append("before20") or bus.Verdict.allow())
-    bus.on("tool", timing="before", priority=10)(lambda e: order.append("before10") or bus.Verdict.allow())
-    bus.on("tool", timing="wrap", priority=50)(lambda e, nxt: order.append("wrap-in") or nxt())
-    bus.on("tool", timing="after", priority=10)(lambda e: order.append("after10") or bus.Verdict.allow())
-    bus.on("tool", timing="after", priority=20)(lambda e: order.append("after20") or bus.Verdict.allow())
+    bus.on("tool", when=lambda e: True, timing="before", priority=20)(lambda e: order.append("before20") or bus.Verdict.allow())
+    bus.on("tool", when=lambda e: True, timing="before", priority=10)(lambda e: order.append("before10") or bus.Verdict.allow())
+    bus.on("tool", when=lambda e: True, timing="wrap", priority=50)(lambda e, nxt: order.append("wrap-in") or nxt())
+    bus.on("tool", when=lambda e: True, timing="after", priority=10)(lambda e: order.append("after10") or bus.Verdict.allow())
+    bus.on("tool", when=lambda e: True, timing="after", priority=20)(lambda e: order.append("after20") or bus.Verdict.allow())
     async def operation(e):
         order.append("operation"); return bus.Verdict.allow("ran")
     v = await bus.dispatch(bus.Event("tool", {"t": 1}), operation=operation)
@@ -26,15 +27,15 @@ async def main():
 
     # 2. a before-block short-circuits: operation never runs
     bus.reset(); ran = []
-    bus.on("tool", timing="before", priority=1)(lambda e: bus.Verdict.block("no"))
-    bus.on("tool", timing="after")(lambda e: ran.append("after") or bus.Verdict.allow())
+    bus.on("tool", when=lambda e: True, timing="before", priority=1)(lambda e: bus.Verdict.block("no"))
+    bus.on("tool", when=lambda e: True, timing="after")(lambda e: ran.append("after") or bus.Verdict.allow())
     async def op2(e): ran.append("op"); return bus.Verdict.allow()
     v = await bus.dispatch(bus.Event("tool", {"t": 2}), operation=op2)
     check("before-block stops the chain", ran == [] and v[0].verdict == "block", f"{ran} {v[0].verdict}")
 
     # 3. a wrap can rewrite the result
     bus.reset()
-    bus.on("tool", timing="wrap")(lambda e, nxt: bus.Verdict.block("downgraded"))
+    bus.on("tool", when=lambda e: True, timing="wrap")(lambda e, nxt: bus.Verdict.block("downgraded"))
     v = await bus.dispatch(bus.Event("tool", {"t": 3}), operation=lambda e: bus.Verdict.allow("fine"))
     check("wrap can override the operation verdict", any(x.verdict == "block" and x.reason == "downgraded" for x in v), str([(x.verdict, x.reason) for x in v]))
 
@@ -54,9 +55,9 @@ async def main():
     rec = Rec(); middleware.tracing = rec
     m1 = middleware.Middleware().install()
     m2 = middleware.Middleware().install()
-    bus.on("e")(lambda e: bus.Verdict.allow())
-    await bus.dispatch(bus.Event("e", {"i": 1}, session="sx"))
-    check("two middleware instances both trace", rec.spans == ["hook:e", "hook:e"], str(rec.spans))
+    bus.on("commit")(lambda e: bus.Verdict.allow())
+    await bus.dispatch(bus.Event("commit", {"i": 1}, session="sx"))
+    check("two middleware instances both trace", rec.spans == ["hook:commit", "hook:commit"], str(rec.spans))
     check("tracer list has both", len(bus._TRACERS) == 2, str(len(bus._TRACERS)))
     m1.uninstall()
     check("uninstall removes only its own tracer", len(bus._TRACERS) == 1, str(len(bus._TRACERS)))
@@ -66,8 +67,8 @@ async def main():
     bus.reset()
     bus.add_budget_checker(lambda e, h: True)
     bus.add_budget_checker(lambda e, h: False)
-    bus.on("e")(lambda e: bus.Verdict.allow())
-    v = await bus.dispatch(bus.Event("e", {"i": 2}, session="sy"))
+    bus.on("commit")(lambda e: bus.Verdict.allow())
+    v = await bus.dispatch(bus.Event("commit", {"i": 2}, session="sy"))
     check("all checkers must allow", v[0].verdict == "block" and "budget" in v[0].reason, str(v[0].verdict))
     bus.reset()
 

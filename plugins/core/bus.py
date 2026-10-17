@@ -140,7 +140,9 @@ def on(name: str, *, when=None, delivery: str | None = None, budget: Budget | No
     """
     name, timing = _events.resolve(name, timing, scope)
     spec = _events.CATALOG[name]
-    delivery = delivery or spec.delivery
+    # The catalog's `delivery` is the default for config-file hooks; an explicit registration is
+    # inline unless it says otherwise. Silently turning on("commit") into a subprocess would surprise.
+    delivery = delivery or "inline"
     if timing == "wrap":
         delivery = "wrap"
     if delivery not in DELIVERIES:
@@ -312,8 +314,12 @@ async def dispatch(event: Event, *, operation=None, max_depth: int = MAX_DEPTH) 
         return []
     _SEEN[key] = now
 
+    try:
+        point, _ = _events.resolve(event.name)
+    except ValueError:
+        point = event.name                      # a custom point still dispatches by exact name
     matched = [h for h in _HANDLERS
-               if h.name == event.name and (h.when is None or h.when(event))]
+               if h.name == point and (h.when is None or h.when(event))]
     before = sorted([h for h in matched if h.timing == "before"],
                     key=lambda h: (h.priority, DELIVERY_ORDER[h.delivery]))
     wraps = sorted([h for h in matched if h.timing == "wrap"], key=lambda h: h.priority)

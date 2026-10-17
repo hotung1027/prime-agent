@@ -116,6 +116,11 @@ def resolve(name: str, timing: str | None = None, scope: str = "both") -> tuple[
     elif name in CATALOG:
         point, timing = name, timing or "before"
     else:
+        for suffix, kind in (("_start", "before"), ("_begin", "before"),
+                             ("_end", "after"), ("_done", "after"), ("_failure", "after")):
+            if name.endswith(suffix) and name[:-len(suffix)] in CATALOG:
+                point, timing = name[:-len(suffix)], timing or kind
+                break
         for prefix, kind in PREFIXES.items():
             rest = name[len(prefix):] if name.startswith(prefix) else ""
             if rest in CATALOG:

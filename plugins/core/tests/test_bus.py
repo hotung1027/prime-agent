@@ -69,8 +69,8 @@ async def main():
     order = []
     @bus.on("stage_end")
     def handoff(e):
-        return bus.Verdict.modify("continue", bus.Continuation.emit("verify", n=1))
-    @bus.on("verify")
+        return bus.Verdict.modify("continue", bus.Continuation.emit("prompt", n=1))
+    @bus.on("prompt")
     def verify(e):
         order.append("verify"); return bus.Verdict.allow()
     v = await bus.dispatch(bus.Event("stage_end"))

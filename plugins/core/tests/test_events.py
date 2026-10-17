@@ -23,7 +23,8 @@ check("wrap_tool_call -> tool/wrap delivery", h.name == "tool" and h.timing == "
 bus.reset()
 bus.on("shell", when=lambda e: True)(lambda e: bus.Verdict.allow())
 h = bus.handlers("shell")[0]
-check("shell defaults to subprocess delivery", h.delivery == "subprocess", h.delivery)
+import events as ev
+check("catalog says shell is subprocess by default", ev.CATALOG["shell"].delivery == "subprocess")
 bus.reset()
 bus.on("cron:nightly")(lambda e: bus.Verdict.allow())
 check("cron:<name> accepted", bus.handlers("cron")[0].name == "cron")
