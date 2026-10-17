@@ -129,6 +129,24 @@ PHASE_PREFIXES = (
     ("post", "after"), ("wrap", "wrap"), ("during", "wrap"),
 )
 PREFIXES = dict(PHASE_PREFIXES)
+
+# CamelCase synonyms so a name can read like a case class: BeforeToolUse, PostModelCall,
+# DuringToolCall, beforeFileEdit. The pair (point, timing) stays canonical underneath - the timing is
+# not decoration, it decides whether the handler may block.
+SYNONYMS = {
+    "tool": "tool", "tooluse": "tool", "toolcall": "tool", "toolinvocation": "tool",
+    "model": "model", "modelcall": "model", "llmcall": "model", "modelinvocation": "model",
+    "shell": "shell", "command": "shell", "commandexecution": "shell",
+    "fileedit": "file_edit", "fileread": "file_read", "filechange": "file_edit",
+    "commit": "commit", "gitcommit": "commit", "push": "push", "gitpush": "push",
+    "session": "session", "agent": "agent", "agentrun": "agent", "turn": "turn",
+    "subagent": "subagent", "prompt": "prompt", "promptsubmit": "prompt",
+    "stage": "stage", "run": "run", "compact": "compact", "wiki": "wiki",
+    "learn": "learn", "cron": "cron", "toolfailure": "tool_failure",
+    "shellexecution": "shell", "contextcompaction": "compact", "userprompt": "prompt",
+    "subagentrun": "subagent", "agentinvocation": "agent", "sessionlifecycle": "session",
+    "modelfailure": "model_failure",
+}
 # alias -> (point, timing): the names in each spec string are listed in the same order as timings.
 ALIASES: dict[str, tuple[str, str]] = {}
 for _spec in CATALOG.values():
@@ -165,8 +183,9 @@ def resolve(name: str, timing: str | None = None, scope: str = "both") -> tuple[
                 if not low.startswith(prefix):
                     continue
                 rest = name[len(prefix):].lower()
-                if rest in CATALOG:
-                    point, timing = rest, timing or kind
+                target = rest if rest in CATALOG else SYNONYMS.get(rest)
+                if target:
+                    point, timing = target, timing or kind
                     break
     spec = CATALOG.get(point) if point else None
     if spec is None:

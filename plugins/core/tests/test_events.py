@@ -38,6 +38,13 @@ try:
     bus.on("tool", timing="after_") if False else bus.on("commit", timing="wrap")(lambda e, n: n())
     check("unsupported timing refused", False)
 except ValueError as e: check("unsupported timing refused", "does not support" in str(e))
+# camelCase case-class names resolve to the same canonical pair
+for alias, expected in (("BeforeToolUse", ("tool", "before")), ("PostModelCall", ("model", "after")),
+                        ("DuringToolCall", ("tool", "wrap")), ("beforeFileEdit", ("file_edit", "before")),
+                        ("BeforeCommit", ("commit", "before")), ("PreShellExecution", ("shell", "before")),
+                        ("postSession", ("session", "after")), ("duringModelCall", ("model", "wrap"))):
+    check(f"{alias} -> {expected[0]}/{expected[1]}", ev.resolve(alias) == expected, str(ev.resolve(alias)))
+
 # phase-prefix equivalence: pre-/before- = before, post-/after- = after, wrap-/during- = wrap
 for alias, expected in (("pre_tool", ("tool", "before")), ("before_tool", ("tool", "before")),
                         ("post_tool", ("tool", "after")), ("after_tool", ("tool", "after")),

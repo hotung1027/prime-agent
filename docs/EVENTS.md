@@ -27,6 +27,20 @@ Canonical events are **points** (`tool`, `model`, `commit`); the *timing* is a s
 | `learn` | before / after | one learning pass | no | durable | global | — |
 | `wiki` | before / after | one vault sync | no | inline | both | — |
 
+## Case-class names
+
+A name can read like a case class; it resolves to the same `(point, timing)` pair:
+
+```
+BeforeToolUse   PostModelCall   DuringToolCall   beforeFileEdit
+BeforeCommit    PreShellExecution   postSession   duringModelCall
+```
+
+The camelCase suffix is matched case-insensitively against a synonym table (`ToolUse`/`ToolCall`/`Tool`
+-> `tool`, `ModelCall`/`LLMCall` -> `model`, `FileEdit` -> `file_edit`, `ShellExecution` -> `shell`),
+so the vocabulary is open without making the point ambiguous. The pair stays canonical because the
+timing decides whether a handler may block.
+
 ## Subscribe
 
 ```python
