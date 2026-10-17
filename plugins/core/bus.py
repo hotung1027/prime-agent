@@ -27,7 +27,7 @@ from pathlib import Path
 
 MAX_DEPTH = 3
 DEDUPE_WINDOW_S = 2.0
-DELIVERY_ORDER = {"inline": 0, "subprocess": 1, "durable": 2}
+DELIVERY_ORDER = {"inline": 0, "subprocess": 1, "durable": 2, "wrap": 0}
 DELIVERIES = tuple(DELIVERY_ORDER)
 # An unmatched tool event fires dozens of times per turn, so a matcher is mandatory for them.
 MATCHER_REQUIRED = {"tool_start", "tool_end", "file_edit"}
@@ -103,21 +103,23 @@ class Budget:
 
 @dataclass
 class Handler:
-    name: str
+    name: str                 # the event: tool, commit, turn, stage, cron:nightly, ...
     fn: object
     when: object
-    delivery: str
+    delivery: str             # inline | subprocess | durable | wrap
     budget: Budget
     id: str
     script: str = ""
+    timing: str = "before"    # before | wrap | after   (the LangChain middleware taxonomy)
+    priority: int = 50        # lower runs first; after-handlers run in reverse
 
 
 _HANDLERS: list[Handler] = []
 _SEEN: dict[str, float] = {}
 _SPEND: dict[str, float] = {}
 _SCRIPT_ALLOWLIST: dict[str, str] = {}      # absolute path -> sha256
-_TRACER = None
-_BUDGET_CHECKER = None
+_TRACERS: list = []
+_BUDGET_CHECKERS: list = []
 _DURABLE_TRANSPORT = None
 
 
@@ -127,10 +129,14 @@ def reset():
 
 
 def on(name: str, *, when=None, delivery: str = "inline", budget: Budget | None = None,
-       script: str = ""):
+       script: str = "", timing: str = "before", priority: int = 50):
     """Register a handler. `when(event)` must be given for tool events."""
     if delivery not in DELIVERIES:
         raise ValueError(f"unknown delivery {delivery!r}; expected one of {DELIVERIES}")
+    if timing not in ("before", "wrap", "after"):
+        raise ValueError(f"unknown timing {timing!r}; expected before | wrap | after")
+    if timing == "wrap":
+        delivery = "wrap"          # a wrap receives (event, next) - it is a delivery, not a timing flag
     if when is None and name in MATCHER_REQUIRED:
         raise ValueError(f"event {name!r} needs a matcher (`when=`): an unmatched tool event "
                          f"fires dozens of times per turn")
@@ -138,7 +144,7 @@ def on(name: str, *, when=None, delivery: str = "inline", budget: Budget | None 
     def register(fn):
         _HANDLERS.append(Handler(name=name, fn=fn, when=when, delivery=delivery,
                                  budget=budget or Budget(), id=getattr(fn, "__qualname__", repr(fn)),
-                                 script=script))
+                                 script=script, timing=timing, priority=priority))
         return fn
     return register
 
@@ -148,12 +154,38 @@ def allow_script(path, sha256: str):
     _SCRIPT_ALLOWLIST[str(Path(path).resolve())] = sha256
 
 
+def add_tracer(fn):
+    """Tracers compose: every one is opened, and closed in reverse order."""
+    _TRACERS.append(fn)
+    return fn
+
+
+def add_budget_checker(fn):
+    """Checkers compose: all must allow the call."""
+    _BUDGET_CHECKERS.append(fn)
+    return fn
+
+
+def remove_tracer(fn):
+    while fn in _TRACERS:
+        _TRACERS.remove(fn)
+
+
+def remove_budget_checker(fn):
+    while fn in _BUDGET_CHECKERS:
+        _BUDGET_CHECKERS.remove(fn)
+
+
 def set_tracer(fn):
-    global _TRACER; _TRACER = fn
+    _TRACERS.clear()
+    if fn is not None:
+        _TRACERS.append(fn)
 
 
 def set_budget_checker(fn):
-    global _BUDGET_CHECKER; _BUDGET_CHECKER = fn
+    _BUDGET_CHECKERS.clear()
+    if fn is not None:
+        _BUDGET_CHECKERS.append(fn)
 
 
 def set_durable_transport(fn):
@@ -197,69 +229,118 @@ async def _run_subprocess(handler: Handler, event: Event) -> Verdict:
                    delivery="subprocess", output=(out or b"").decode("utf-8", "replace")[:2000])
 
 
-async def dispatch(event: Event, *, max_depth: int = MAX_DEPTH) -> list[Verdict]:
-    """Match -> order by delivery -> invoke -> collect verdicts -> emit continuations."""
+async def _invoke(event: Event, handler: Handler, *, next_call=None) -> Verdict:
+    """One handler: budgets, tracers, delivery, error isolation, timing."""
+    for checker in _BUDGET_CHECKERS:
+        try:
+            if not checker(event, handler):
+                return Verdict.block(f"budget exhausted for {handler.id}",
+                                     handler=handler.id, delivery=handler.delivery)
+        except Exception:
+            continue                                  # a broken checker must not block work
+    started = time.monotonic()
+    handles = []
+    for tracer in _TRACERS:
+        try:
+            handles.append(tracer(event, handler))
+        except Exception:
+            handles.append(None)                      # tracing must never break the work
+    try:
+        if handler.delivery == "subprocess":
+            verdict = await _run_subprocess(handler, event)
+        elif handler.delivery == "durable":
+            if _DURABLE_TRANSPORT is None:
+                verdict = Verdict.block("no durable transport registered",
+                                        handler=handler.id, delivery="durable")
+            else:
+                result = _DURABLE_TRANSPORT(event, handler)
+                verdict = await result if inspect.isawaitable(result) else result
+        elif handler.delivery == "wrap":
+            result = handler.fn(event, next_call)
+            verdict = await result if inspect.isawaitable(result) else result
+        else:
+            verdict = await _call(handler.fn, event)
+        if not isinstance(verdict, Verdict):
+            verdict = Verdict.allow(str(verdict or ""))
+        verdict.handler = handler.id
+        verdict.delivery = handler.delivery
+    except Exception as exc:
+        verdict = Verdict.escalate(f"{type(exc).__name__}: {exc}", handler=handler.id,
+                                   delivery=handler.delivery)
+    verdict.duration_ms = round((time.monotonic() - started) * 1000, 2)
+    for handle in reversed(handles):                  # close in reverse: onion order
+        if handle is not None and hasattr(handle, "close"):
+            try:
+                handle.close(verdict)
+            except Exception:
+                pass
+    return verdict
+
+
+async def dispatch(event: Event, *, operation=None, max_depth: int = MAX_DEPTH) -> list[Verdict]:
+    """before -> wrap(operation) -> after, in the LangChain middleware taxonomy.
+
+    `before` handlers run by ascending priority and may block, which stops the chain.
+    `wrap` handlers form an onion around `operation` (the real tool/model/commit call).
+    `after` handlers run in reverse priority and may escalate, never un-block.
+    """
     if event.depth > max_depth:
         return [Verdict.block(f"event depth {event.depth} exceeds {max_depth}",
                               handler="bus", delivery="bus")]
     key = event.key()
     now = time.time()
-    # _SEEN is insertion-ordered, so prune from the front only while the head is stale. Scanning the
-    # whole dict on every dispatch is O(n^2) and was measured at 213 us/dispatch; this is amortised O(1).
+    # _SEEN is insertion-ordered: prune from the head while stale (O(1) amortised; a full scan here
+    # was measured at 213 us per dispatch).
     while _SEEN:
         head = next(iter(_SEEN))
         if now - _SEEN[head] <= DEDUPE_WINDOW_S:
             break
         _SEEN.pop(head)
     if key in _SEEN:
-        return []                       # same event within the window: already handled
+        return []
     _SEEN[key] = now
 
     matched = [h for h in _HANDLERS
                if h.name == event.name and (h.when is None or h.when(event))]
-    matched.sort(key=lambda h: DELIVERY_ORDER[h.delivery])
+    before = sorted([h for h in matched if h.timing == "before"],
+                    key=lambda h: (h.priority, DELIVERY_ORDER[h.delivery]))
+    wraps = sorted([h for h in matched if h.timing == "wrap"], key=lambda h: h.priority)
+    after = sorted([h for h in matched if h.timing == "after"], key=lambda h: -h.priority)
 
     results: list[Verdict] = []
-    for handler in matched:
-        if _BUDGET_CHECKER is not None and not _BUDGET_CHECKER(event, handler):
-            results.append(Verdict.block(f"budget exhausted for {handler.id}",
-                                         handler=handler.id, delivery=handler.delivery))
-            continue
-        started = time.monotonic()
-        try:
-            span = _TRACER(event, handler) if _TRACER is not None else None
-        except Exception:
-            span = None                     # tracing must never break the work it observes
-        try:
-            if handler.delivery == "subprocess":
-                verdict = await _run_subprocess(handler, event)
-            elif handler.delivery == "durable":
-                if _DURABLE_TRANSPORT is None:
-                    verdict = Verdict.block("no durable transport registered",
-                                            handler=handler.id, delivery="durable")
-                else:
-                    result = _DURABLE_TRANSPORT(event, handler)
-                    if inspect.isawaitable(result):
-                        result = await result
-                    verdict = result
-            else:
-                verdict = await _call(handler.fn, event)
-            if not isinstance(verdict, Verdict):
-                verdict = Verdict.allow(str(verdict or ""))
-            verdict.handler = handler.id
-            verdict.delivery = handler.delivery
-        except Exception as exc:                       # a handler error must not kill the bus
-            verdict = Verdict.escalate(f"{type(exc).__name__}: {exc}", handler=handler.id,
-                                       delivery=handler.delivery)
-        verdict.duration_ms = round((time.monotonic() - started) * 1000, 2)
-        if span is not None and hasattr(span, "close"):
-            try: span.close(verdict)
-            except Exception: pass
+    for handler in before:
+        verdict = await _invoke(event, handler)
         results.append(verdict)
+        if verdict.verdict in ("block", "escalate"):
+            return results                             # short-circuit, like a refused commit
+
+    if wraps or operation is not None:
+        async def core():
+            if operation is None:
+                return Verdict.allow("no operation")
+            result = operation(event)
+            if inspect.isawaitable(result):
+                result = await result
+            return result if isinstance(result, Verdict) else Verdict.allow(str(result or ""))
+
+        chain = core
+        for handler in reversed(wraps):
+            nxt = chain
+
+            async def wrapped(handler=handler, nxt=nxt):
+                return await _invoke(event, handler, next_call=nxt)
+
+            chain = wrapped
+        results.append(await chain())
+
+    for handler in after:
+        results.append(await _invoke(event, handler))
+
+    for verdict in list(results):
         if verdict.continuation is not None:
-            results.extend(await dispatch(event.child(verdict.continuation.name,
-                                                      **verdict.continuation.attrs),
-                                          max_depth=max_depth))
+            results.extend(await dispatch(
+                event.child(verdict.continuation.name, **verdict.continuation.attrs),
+                max_depth=max_depth))
     return results
 
 

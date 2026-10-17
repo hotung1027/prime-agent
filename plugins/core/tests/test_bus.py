@@ -37,7 +37,9 @@ async def main():
     second = await bus.dispatch(bus.Event("commit", {"loc": 555}))
     check("dedupe: second identical event is a no-op", len(first) == 1 and second == [], f"{len(first)}/{second}")
 
-    # 5. subprocess: allowlisted, content-pinned
+    # 5. subprocess: allowlisted, content-pinned (fresh registry: a before-handler from an
+    #    earlier case would short-circuit the chain)
+    bus.reset()
     tmp = Path(tempfile.mkdtemp())
     script = tmp / "check.sh"; script.write_text("#!/usr/bin/env bash\nread -r line\nexit 0\n")
     script.chmod(0o755)
