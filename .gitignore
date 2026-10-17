@@ -10,3 +10,14 @@ fmt-*.log
 tests-*.log
 test-compile-*.log
 
+# plugins
+plugins/trace/langfuse.json
+plugins/**/__pycache__/
+plugins/**/*.pyc
+plugins/**/*.log
+plugins/durable_function/worker-rs/target/
+plugins/**/traces/
+
+# personal agent state - exported for reference, never committed
+harness/memories/
+harness/prompts/
