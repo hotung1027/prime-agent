@@ -1,0 +1,17 @@
+[package]
+name = "pipeline-workers"
+version = "0.1.0"
+edition = "2021"
+
+# Temporal Rust SDK. NOTE: the macro-generated code refers to `::futures` and `::temporalio_common`
+# as ABSOLUTE paths, so both must be direct dependencies here or the crate will not compile.
+[dependencies]
+temporalio-sdk = "1.1"
+temporalio-client = "1.1"
+temporalio-macros = "1.1"
+temporalio-common = "1.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time"] }
