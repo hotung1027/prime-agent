@@ -69,6 +69,24 @@ bus.add("commit", callback=size_gate, timing="before", delivery="subprocess",
         script=".githooks/check_commit_size.sh")
 ```
 
+## The class is the dispatch key
+
+A typed event carries its timing, so dispatching one runs **only that phase**:
+
+```python
+await bus.dispatch(BeforeCommit(bus.Event("commit", {"staged": True})))   # before handlers only
+await bus.dispatch(AfterCommit(bus.Event("commit", {"sha": "c0ffee"})))   # after handlers only
+await bus.emit(AfterCommit, sha="c0ffee")                                 # same, building the event
+```
+
+A raw `Event` still runs every phase in one call, for the simple case. The phase is part of the event
+identity, so `before_commit` and `after_commit` with identical payloads are two moments, never deduped
+into one.
+
+Payloads are per phase: `before_commit` carries `staged/loc/files/message`, `after_commit` carries
+`sha/loc/files/message`; `before_tool` carries `tool/args/command`, `after_tool` carries
+`tool/command/exit/output`.
+
 ## Phase semantics
 
 `before`, `wrap` and `after` are **relative to the point's anchor**, and the anchor differs per point:

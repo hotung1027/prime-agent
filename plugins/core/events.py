@@ -26,6 +26,7 @@ class Spec:
     delivery: str = "inline"       # default delivery when none is given
     scope: str = "both"            # global | project | both
     payload: tuple = ()
+    after_payload: tuple = ()      # the AFTER phase sees different fields (e.g. a commit sha)
     langchain: str = ""
     cursor: str = ""
 
@@ -52,12 +53,14 @@ _add(Spec("subagent", ("before", "after"), delivery="inline", scope="both",
 
 # --- model ------------------------------------------------------------------------------------
 _add(Spec("model", ("before", "after", "wrap"), delivery="inline", scope="both",
-          payload=("messages", "model", "tools"), langchain="before_model / after_model / wrap_model_call"))
+          payload=("messages", "model", "tools"),
+          after_payload=("model", "messages", "response", "usage"), langchain="before_model / after_model / wrap_model_call"))
 _add(Spec("model_failure", ("after",), delivery="inline", scope="both", payload=("error", "attempt")))
 
 # --- tools ------------------------------------------------------------------------------------
 _add(Spec("tool", ("before", "after", "wrap"), delivery="inline", scope="both",
-          payload=("tool", "args", "command"), langchain="before_tool / after_tool / wrap_tool_call",
+          payload=("tool", "args", "command"),
+          after_payload=("tool", "command", "exit", "output"), langchain="before_tool / after_tool / wrap_tool_call",
           cursor="preToolUse / postToolUse"))
 _add(Spec("tool_failure", ("after",), delivery="inline", scope="both",
           payload=("tool", "error"), cursor="postToolUseFailure"))
@@ -74,7 +77,8 @@ _add(Spec("prompt", ("before",), delivery="inline", scope="both",
 
 # --- git --------------------------------------------------------------------------------------
 _add(Spec("commit", ("before", "after"), delivery="subprocess", scope="both",
-          payload=("staged", "loc", "files", "message")))
+          payload=("staged", "loc", "files", "message"),
+          after_payload=("sha", "loc", "files", "message")))
 _add(Spec("push", ("before", "after"), delivery="subprocess", scope="both",
           payload=("branch", "remote")))
 
@@ -250,8 +254,9 @@ PHASE_CLASS = {"before": "Before", "after": "After", "wrap": "During"}
 
 def make_class(point: str, timing: str) -> type:
     name = PHASE_CLASS[timing] + SUFFIX.get(point, point.title())
-    return type(name, (TypedEvent,), {"point": point, "timing": timing,
-                                      "payload": CATALOG[point].payload})
+    spec = CATALOG[point]
+    payload = spec.after_payload if (timing == "after" and spec.after_payload) else spec.payload
+    return type(name, (TypedEvent,), {"point": point, "timing": timing, "payload": payload})
 
 
 CLASSES: dict[tuple[str, str], type] = {

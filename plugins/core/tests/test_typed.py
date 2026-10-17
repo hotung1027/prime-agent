@@ -43,6 +43,28 @@ async def main():
     await bus.dispatch(bus.Event("tool", {"command": "x"}))
     check("raw and typed registrations coexist", shapes == [False, "BeforeToolUse"], str(shapes))
 
+    # the class IS the dispatch key: a typed event runs only its own phase
+    bus.reset(); order = []
+    bus.add("commit", timing="before", callback=lambda e: order.append("before") or bus.Verdict.allow())
+    bus.add("commit", timing="after", callback=lambda e: order.append("after") or bus.Verdict.allow())
+    await bus.dispatch(ev.BeforeCommit(bus.Event("commit", {"sha": "a"})))
+    check("BeforeCommit runs only the before phase", order == ["before"], str(order))
+    await bus.dispatch(ev.AfterCommit(bus.Event("commit", {"sha": "a"})))
+    check("AfterCommit runs only the after phase", order == ["before", "after"], str(order))
+
+    # a raw Event keeps the classic all-phases behaviour
+    bus.reset(); order = []
+    bus.add("commit", timing="before", callback=lambda e: order.append("before") or bus.Verdict.allow())
+    bus.add("commit", timing="after", callback=lambda e: order.append("after") or bus.Verdict.allow())
+    await bus.dispatch(bus.Event("commit", {"sha": "b"}))
+    check("raw Event runs both phases", order == ["before", "after"], str(order))
+
+    # emit() builds the raw event from the class
+    bus.reset(); got = []
+    bus.add(ev.AfterCommit, callback=lambda e: got.append(e.sha) or bus.Verdict.allow())
+    await bus.emit(ev.AfterCommit, sha="c0ffee")
+    check("emit() carries attributes through", got == ["c0ffee"], str(got))
+
 asyncio.run(main())
 failed = [c for c in ok if not c[1]]
 print(f"\n{len(ok)-len(failed)}/{len(ok)} checks passed")

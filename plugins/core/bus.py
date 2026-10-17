@@ -317,17 +317,32 @@ async def _invoke(event: Event, handler: Handler, *, next_call=None) -> Verdict:
     return verdict
 
 
-async def dispatch(event: Event, *, operation=None, max_depth: int = MAX_DEPTH) -> list[Verdict]:
-    """before -> wrap(operation) -> after, in the LangChain middleware taxonomy.
+def _phase_of(event):
+    """A typed event carries its timing, so it is a complete dispatch key. A raw Event has none."""
+    timing = getattr(event, "timing", None)
+    return timing if timing in ("before", "wrap", "after") else None
 
-    `before` handlers run by ascending priority and may block, which stops the chain.
-    `wrap` handlers form an onion around `operation` (the real tool/model/commit call).
-    `after` handlers run in reverse priority and may escalate, never un-block.
+
+def _raw_of(event):
+    return getattr(event, "raw", event)
+
+
+async def dispatch(event, *, operation=None, max_depth: int = MAX_DEPTH) -> list[Verdict]:
+    """Dispatch one moment.
+
+    Raw Event: before -> wrap(operation) -> after in one call.
+    Typed event (BeforeToolUse(...), AfterToolUse(...)): only that phase runs, because the class
+    already says which moment it is - the class is the dispatch key.
     """
+    phase = _phase_of(event)
+    if phase is not None:
+        event = _raw_of(event)
     if event.depth > max_depth:
         return [Verdict.block(f"event depth {event.depth} exceeds {max_depth}",
                               handler="bus", delivery="bus")]
-    key = event.key()
+    # the phase is part of the identity: before_tool and after_tool are different moments of the
+    # same call, and deduping them together would silently drop one.
+    key = f"{event.key()}:{phase or 'all'}"
     now = time.time()
     # _SEEN is insertion-ordered: prune from the head while stale (O(1) amortised; a full scan here
     # was measured at 213 us per dispatch).
@@ -346,10 +361,12 @@ async def dispatch(event: Event, *, operation=None, max_depth: int = MAX_DEPTH) 
         point = event.name                      # a custom point still dispatches by exact name
     matched = [h for h in _HANDLERS
                if h.name == point and (h.when is None or h.when(event))]
-    before = sorted([h for h in matched if h.timing == "before"],
+    before = sorted([h for h in matched if h.timing == "before" and phase in (None, "before")],
                     key=lambda h: (h.priority, DELIVERY_ORDER[h.delivery]))
-    wraps = sorted([h for h in matched if h.timing == "wrap"], key=lambda h: h.priority)
-    after = sorted([h for h in matched if h.timing == "after"], key=lambda h: -h.priority)
+    wraps = sorted([h for h in matched if h.timing == "wrap" and phase in (None, "before", "wrap")],
+                   key=lambda h: h.priority)
+    after = sorted([h for h in matched if h.timing == "after" and phase in (None, "after")],
+                   key=lambda h: -h.priority)
 
     results: list[Verdict] = []
     for handler in before:
@@ -392,6 +409,16 @@ async def dispatch(event: Event, *, operation=None, max_depth: int = MAX_DEPTH) 
                 event.child(verdict.continuation.name, **verdict.continuation.attrs),
                 max_depth=max_depth))
     return results
+
+
+async def emit(event_class, *, operation=None, **attrs) -> list[Verdict]:
+    """Build the raw event for a typed class and dispatch exactly that phase.
+
+        await bus.emit(AfterToolUse, tool="bash", command="git commit -m x", exit=0)
+    """
+    raw = Event(event_class.point, attrs)
+    raw.timing = event_class.timing
+    return await dispatch(event_class(raw), operation=operation)
 
 
 def blocked(results) -> list[Verdict]:
