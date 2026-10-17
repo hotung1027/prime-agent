@@ -25,12 +25,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import events as _events          # the prebuilt catalog: canonical points + aliases
+
 MAX_DEPTH = 3
 DEDUPE_WINDOW_S = 2.0
 DELIVERY_ORDER = {"inline": 0, "subprocess": 1, "durable": 2, "wrap": 0}
 DELIVERIES = tuple(DELIVERY_ORDER)
 # An unmatched tool event fires dozens of times per turn, so a matcher is mandatory for them.
-MATCHER_REQUIRED = {"tool_start", "tool_end", "file_edit"}
+MATCHER_REQUIRED = {"tool", "shell", "file_edit"}   # canonical points
 
 
 @dataclass
@@ -128,9 +130,19 @@ def reset():
     _HANDLERS.clear(); _SEEN.clear(); _SPEND.clear(); _SCRIPT_ALLOWLIST.clear()
 
 
-def on(name: str, *, when=None, delivery: str = "inline", budget: Budget | None = None,
-       script: str = "", timing: str = "before", priority: int = 50):
-    """Register a handler. `when(event)` must be given for tool events."""
+def on(name: str, *, when=None, delivery: str | None = None, budget: Budget | None = None,
+       script: str = "", timing: str | None = None, priority: int = 50, scope: str = "both"):
+    """Register a handler.
+
+    `name` may be a canonical point (`tool`, `commit`), a timing alias (`before_tool`, `wrap_tool`),
+    or a LangChain/Cursor name (`preToolUse`, `wrap_model_call`). The catalog resolves it and rejects
+    an unknown point, an unsupported timing, or a global event registered per project.
+    """
+    name, timing = _events.resolve(name, timing, scope)
+    spec = _events.CATALOG[name]
+    delivery = delivery or spec.delivery
+    if timing == "wrap":
+        delivery = "wrap"
     if delivery not in DELIVERIES:
         raise ValueError(f"unknown delivery {delivery!r}; expected one of {DELIVERIES}")
     if timing not in ("before", "wrap", "after"):
