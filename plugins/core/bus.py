@@ -124,6 +124,7 @@ class Handler:
     script: str = ""
     timing: str = "before"    # before | wrap | after   (the LangChain middleware taxonomy)
     priority: int = 50        # lower runs first; after-handlers run in reverse
+    cls: object = None        # typed event class: the callback receives cls(raw_event)
 
 
 _HANDLERS: list[Handler] = []
@@ -174,7 +175,7 @@ def add(event: str, callback, *, timing: str | None = None, when=None, delivery:
     `when` is the filter: a callable(event)->bool, a regex matched against `event.text()` (the command,
     tool name or message), or a {field: regex} dict. It is mandatory for high-frequency points.
     """
-    point, timing = _events.resolve(event, timing, scope)
+    point, timing, typed = _events.resolve_event(event) if not isinstance(event, str) else (*_events.resolve(event, timing, scope), None)
     if timing == "wrap":
         delivery = "wrap"
     delivery = delivery or "inline"
@@ -182,7 +183,7 @@ def add(event: str, callback, *, timing: str | None = None, when=None, delivery:
         raise ValueError(f"unknown delivery {delivery!r}; expected one of {DELIVERIES}")
     handler = Handler(name=point, fn=callback, when=_matcher(when, point), delivery=delivery,
                       budget=budget or Budget(), id=getattr(callback, "__qualname__", repr(callback)),
-                      script=script, timing=timing, priority=priority)
+                      script=script, timing=timing, priority=priority, cls=typed)
     _HANDLERS.append(handler)
     return callback
 
@@ -297,7 +298,8 @@ async def _invoke(event: Event, handler: Handler, *, next_call=None) -> Verdict:
             result = handler.fn(event, next_call)
             verdict = await result if inspect.isawaitable(result) else result
         else:
-            verdict = await _call(handler.fn, event)
+            arg = handler.cls(event) if handler.cls is not None else event
+            verdict = await _call(handler.fn, arg)
         if not isinstance(verdict, Verdict):
             verdict = Verdict.allow(str(verdict or ""))
         verdict.handler = handler.id

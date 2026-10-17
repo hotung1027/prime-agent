@@ -41,6 +41,24 @@ The camelCase suffix is matched case-insensitively against a synonym table (`Too
 so the vocabulary is open without making the point ambiguous. The pair stays canonical because the
 timing decides whether a handler may block.
 
+## Typed event classes
+
+`events.py` generates one class per (point, timing). A class is the event identity, and the callback
+receives an instance with the payload as attributes:
+
+```python
+from events import BeforeToolUse, AfterModelCall, DuringToolCall, PostCommit
+
+bus.add(BeforeToolUse, callback=lint, when=r"^git ")     # event.command, event.tool
+bus.add(AfterModelCall, callback=audit)                  # event.model, event.messages
+bus.add(DuringToolCall, callback=timer, when=r".")       # fn(event, next)
+bus.add(PostCommit, callback=notify)                     # alias of AfterCommit
+```
+
+Names: `Before*`, `After*`, `During*` (wrap), with `Pre*`, `Post*`, `Wrap*` aliases and noun aliases
+(`DuringToolCall` == `DuringToolUse`, `AfterLLMCall` == `AfterModelCall`). A raw `Event` still works:
+`bus.add("tool", callback=fn, when=...)`.
+
 ## Subscribe
 
 ```python

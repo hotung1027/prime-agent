@@ -57,14 +57,14 @@ _add(Spec("model_failure", ("after",), delivery="inline", scope="both", payload=
 
 # --- tools ------------------------------------------------------------------------------------
 _add(Spec("tool", ("before", "after", "wrap"), delivery="inline", scope="both",
-          payload=("tool", "args"), langchain="before_tool / after_tool / wrap_tool_call",
+          payload=("tool", "args", "command"), langchain="before_tool / after_tool / wrap_tool_call",
           cursor="preToolUse / postToolUse"))
 _add(Spec("tool_failure", ("after",), delivery="inline", scope="both",
           payload=("tool", "error"), cursor="postToolUseFailure"))
 
 # --- shell and files --------------------------------------------------------------------------
 _add(Spec("shell", ("before", "after"), delivery="subprocess", scope="both",
-          payload=("argv", "cwd", "exit"), cursor="beforeShellExecution / afterShellExecution"))
+          payload=("command", "argv", "cwd", "exit"), cursor="beforeShellExecution / afterShellExecution"))
 _add(Spec("file_read", ("before",), delivery="inline", scope="both",
           payload=("path",), cursor="beforeReadFile"))
 _add(Spec("file_edit", ("before", "after"), delivery="subprocess", scope="both",
@@ -197,3 +197,90 @@ def resolve(name: str, timing: str | None = None, scope: str = "both") -> tuple[
     if scope == "project" and spec.scope == "global":
         raise ValueError(f"{point!r} is a global-scope event; it cannot be registered per project")
     return point, timing
+
+
+# --------------------------------------------------------------------------------------------------
+# Typed event classes: bus.add(BeforeToolUse, callback=lint, when=...)
+#
+# Each class carries its point, its timing and the payload fields the catalog declares. The bus builds
+# an instance from the raw event before calling the callback, so a handler sees typed attributes
+# (`event.command`) instead of dict lookups. The class is the identity; the (point, timing) pair is
+# still what the dispatcher matches on.
+
+class TypedEvent:
+    """A typed view over a raw Event. Payload fields are read through `attrs`."""
+    point = ""
+    timing = ""
+    payload: tuple = ()
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __getattr__(self, name):
+        payload = type(self).payload
+        if name in payload:
+            return self.raw.attrs.get(name)
+        raise AttributeError(name)
+
+    @property
+    def attrs(self):
+        return self.raw.attrs
+
+    @property
+    def session(self):
+        return self.raw.session
+
+    def text(self):
+        return self.raw.text()
+
+    def key(self):
+        return self.raw.key()
+
+
+SUFFIX = {
+    "tool": "ToolUse", "model": "ModelCall", "commit": "Commit", "push": "Push",
+    "session": "Session", "agent": "AgentRun", "turn": "Turn", "compact": "Compact",
+    "subagent": "SubagentRun", "shell": "ShellExecution", "file_read": "FileRead",
+    "file_edit": "FileEdit", "prompt": "PromptSubmit", "run": "Run", "stage": "Stage",
+    "cron": "Cron", "learn": "Learn", "wiki": "Wiki",
+    "tool_failure": "ToolFailure", "model_failure": "ModelFailure",
+}
+PHASE_CLASS = {"before": "Before", "after": "After", "wrap": "During"}
+
+
+def make_class(point: str, timing: str) -> type:
+    name = PHASE_CLASS[timing] + SUFFIX.get(point, point.title())
+    return type(name, (TypedEvent,), {"point": point, "timing": timing,
+                                      "payload": CATALOG[point].payload})
+
+
+CLASSES: dict[tuple[str, str], type] = {
+    (point, timing): make_class(point, timing)
+    for point, spec in CATALOG.items() for timing in spec.timings
+}
+globals().update({cls.__name__: cls for cls in CLASSES.values()})
+# friendly aliases: Pre<X> = Before<X>, Post<X> = After<X>, Wrap<X> = During<X>
+# noun aliases: DuringToolCall == DuringToolUse, AfterLLMCall == AfterModelCall, ...
+CLASS_NOUN_ALIASES = {"ToolCall": "ToolUse", "LLMCall": "ModelCall", "CommandExecution": "ShellExecution",
+                      "FileChange": "FileEdit", "GitCommit": "Commit", "GitPush": "Push"}
+for _cls in list(CLASSES.values()):
+    _rest = _cls.__name__[len(PHASE_CLASS[_cls.timing]):]
+    for _alias, _canonical in CLASS_NOUN_ALIASES.items():
+        if _rest == _canonical:
+            globals()[PHASE_CLASS[_cls.timing] + _alias] = _cls
+    if _cls.timing == "before":
+        globals()["Pre" + _rest] = _cls
+    elif _cls.timing == "after":
+        globals()["Post" + _rest] = _cls
+    else:
+        globals()["Wrap" + _rest] = _cls
+
+
+def resolve_event(event):
+    """A class, an instance or a name -> (point, timing, class-or-None)."""
+    if isinstance(event, type) and issubclass(event, TypedEvent):
+        return event.point, event.timing, event
+    if isinstance(event, TypedEvent):
+        return event.point, event.timing, type(event)
+    point, timing = resolve(event, None, "both")
+    return point, timing, CLASSES.get((point, timing))
