@@ -1,0 +1,5 @@
+{
+  "public_key": "pk-lf-REPLACE",
+  "secret_key": "sk-lf-REPLACE",
+  "host": "https://cloud.langfuse.com"
+}
