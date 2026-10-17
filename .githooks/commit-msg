@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Conventional commits, because the log is the changelog nobody has to write twice.
+set -euo pipefail
+msg_file=$1
+first=$(grep -v '^#' "$msg_file" | sed '/^[[:space:]]*$/d' | head -1 || true)
+if [ -z "$first" ]; then
+  echo "REFUSED: empty commit message." >&2; exit 1
+fi
+case "$first" in Merge*|Revert*) exit 0 ;; esac
+if ! printf '%s' "$first" | grep -qE '^(feat|fix|docs|test|chore|refactor|perf|build|ci)(\([a-z0-9_-]+\))?!?: .+'; then
+  cat >&2 <<EOF
+REFUSED: "${first}"
+Use a conventional message: <type>(<scope>): <subject>
+  types: feat fix docs test chore refactor perf build ci
+EOF
+  exit 1
+fi

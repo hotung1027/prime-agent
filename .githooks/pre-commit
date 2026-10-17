@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Refuse a bulk commit before it exists. Deterministic, no model, no network.
+# Thresholds are configurable; the defaults encode "one commit = one responsibility".
+set -euo pipefail
+MAX_LINES=${PRIME_MAX_COMMIT_LINES:-1000}
+MAX_FILES=${PRIME_MAX_COMMIT_FILES:-12}
+
+git diff --cached --quiet && exit 0
+
+lines=$(git diff --cached --numstat | awk '{a+=$1; d+=$2} END {print a+d+0}')
+files=$(git diff --cached --name-only | wc -l)
+
+if [ "$lines" -gt "$MAX_LINES" ] || [ "$files" -gt "$MAX_FILES" ]; then
+  cat >&2 <<EOF
+REFUSED: ${lines} lines / ${files} files in one commit (limit ${MAX_LINES} / ${MAX_FILES}).
+Policy: one commit = one responsibility. Split by layer, e.g. schema -> parser -> handler -> tests.
+A 1000+ line diff is not reviewable: at ~300 LOC/hour it costs a reviewer a whole day.
+Genuine exception: git commit --no-verify (CI still runs these checks).
+EOF
+  exit 1
+fi
+
+git diff --cached --check >&2 || { echo "REFUSED: whitespace errors in the staged diff." >&2; exit 1; }
+
+if command -v ruff >/dev/null 2>&1; then
+  py=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' || true)
+  # shellcheck disable=SC2086
+  [ -n "$py" ] && ruff check $py
+fi
+if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ] && git diff --cached --name-only | grep -qE '\.rs$'; then
+  cargo fmt --check
+fi
+exit 0
