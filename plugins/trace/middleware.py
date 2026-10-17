@@ -70,13 +70,14 @@ class Middleware:
 
     # ---- install -------------------------------------------------------
     def install(self) -> "Middleware":
-        bus.set_tracer(self._tracer)
-        bus.set_budget_checker(self._check)
+        # additive, so two middleware instances compose instead of clobbering each other
+        bus.add_tracer(self._tracer)
+        bus.add_budget_checker(self._check)
         return self
 
     def uninstall(self):
-        bus.set_tracer(None)
-        bus.set_budget_checker(None)
+        bus.remove_tracer(self._tracer)
+        bus.remove_budget_checker(self._check)
 
     # ---- budget --------------------------------------------------------
     def _root_of(self, event) -> _Root:
