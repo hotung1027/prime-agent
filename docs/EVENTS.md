@@ -4,28 +4,42 @@ Canonical events are **points** (`tool`, `model`, `commit`); the *timing* is a s
 (`before` | `wrap` | `after`). LangChain and Cursor names resolve to the same event, so
 `on("before_tool")`, `on("preToolUse")` and `on("tool", timing="before")` are one registration.
 
-| point | timings | LangChain | Cursor | blocks | default delivery | scope | payload |
-|---|---|---|---|---|---|---|---|
-| `session` | before / after | — | sessionStart / sessionEnd | no | inline | both | session, cwd, project |
-| `agent` | before / after | before_agent / after_agent | afterAgentResponse | yes | inline | both | task, result |
-| `turn` | before / after | — | — | yes | inline | both | turn, tokens, corrections |
-| `compact` | before / after | — | — | no | inline | both | pre_tokens, post_tokens |
-| `subagent` | before / after | — | — | yes | inline | both | name, model, ok |
-| `model` | before / after / wrap | before_model / after_model / wrap_model_call | — | yes | inline | both | messages, model, tools |
-| `model_failure` | after | — | — | yes | inline | both | error, attempt |
-| `tool` | before / after / wrap | before_tool / after_tool / wrap_tool_call | preToolUse / postToolUse | yes | inline | both | tool, args |
-| `tool_failure` | after | — | postToolUseFailure | yes | inline | both | tool, error |
-| `shell` | before / after | — | beforeShellExecution / afterShellExecution | yes | subprocess | both | argv, cwd, exit |
-| `file_read` | before | — | beforeReadFile | yes | inline | both | path |
-| `file_edit` | before / after | — | beforeFileEdit / afterFileEdit | yes | subprocess | both | path, diff |
-| `prompt` | before | — | beforeSubmitPrompt | yes | inline | both | prompt |
-| `commit` | before / after | — | — | yes | subprocess | both | staged, loc, files, message |
-| `push` | before / after | — | — | yes | subprocess | both | branch, remote |
-| `run` | before / after | — | — | yes | inline | project | brief, ok |
-| `stage` | before / after | — | — | yes | inline | project | stage, passed, spec |
-| `cron` | before | — | — | no | durable | global | name, schedule |
-| `learn` | before / after | — | — | no | durable | global | session, turns, corrections |
-| `wiki` | before / after | — | — | no | inline | both | vault, created, updated, deleted, skipped |
+| point | timings | anchored to | blocks | default delivery | scope | LangChain / Cursor |
+|---|---|---|---|---|---|---|
+| `session` | before / after | the session lifetime | no | inline | both | sessionStart / sessionEnd |
+| `agent` | before / after | one agent invocation | before only | inline | both | before_agent / after_agent |
+| `turn` | before / after | one user turn | before only | inline | both | — |
+| `compact` | before / after | a context compaction | no | inline | both | — |
+| `subagent` | before / after | one child agent run | before only | inline | both | — |
+| `model` | before / after / wrap | a model request and its response | before only | inline | both | before_model / after_model / wrap_model_call |
+| `model_failure` | after | a failed model request | before only | inline | both | — |
+| `tool` | before / after / wrap | one tool execution | before only | inline | both | before_tool / after_tool / wrap_tool_call |
+| `tool_failure` | after | a tool that raised or returned an error | before only | inline | both | postToolUseFailure |
+| `shell` | before / after | one shell command | before only | subprocess | both | beforeShellExecution / afterShellExecution |
+| `file_read` | before | reading a file | before only | inline | both | beforeReadFile |
+| `file_edit` | before / after | editing a file | before only | subprocess | both | beforeFileEdit / afterFileEdit |
+| `prompt` | before | submitting the user prompt | before only | inline | both | beforeSubmitPrompt |
+| `commit` | before / after | creating a git commit | before only | subprocess | both | — |
+| `push` | before / after | pushing to a remote | before only | subprocess | both | — |
+| `run` | before / after | one factory run | before only | inline | project | — |
+| `stage` | before / after | one factory stage | before only | inline | project | — |
+| `cron` | before | a scheduled tick | no | durable | global | — |
+| `learn` | before / after | one learning pass | no | durable | global | — |
+| `wiki` | before / after | one vault sync | no | inline | both | — |
+
+## Phase semantics
+
+`before`, `wrap` and `after` are **relative to the point's anchor**, and the anchor differs per point:
+
+| phase | means | may |
+|---|---|---|
+| `before` | the operation has not run yet | change its inputs or **block** it |
+| `wrap` | around the operation | call it, skip it, or **replace** its result |
+| `after` | the operation has **completed** | observe, escalate, or continue - never un-run it |
+
+So `post_tool` is after the tool returned, `post_model` is after the model responded, and `post_commit`
+is after the commit exists. An `after` handler that returns a block is recorded as an **escalation**,
+because claiming to have prevented something already done is a lie the trace would repeat.
 
 ## Scopes
 

@@ -14,14 +14,15 @@ A project hook may add restrictions, never remove them.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 @dataclass(frozen=True)
 class Spec:
     point: str
     timings: tuple = ("before", "after")
-    blocking: bool = True          # may a `before` handler stop the operation?
+    blocking: bool = True          # may a `before` handler stop it? `after` never can.
+    anchor: str = ""               # what before/after are measured against for this point
     delivery: str = "inline"       # default delivery when none is given
     scope: str = "both"            # global | project | both
     payload: tuple = ()
@@ -90,6 +91,35 @@ _add(Spec("learn", ("before", "after"), blocking=False, delivery="durable", scop
 _add(Spec("wiki", ("before", "after"), blocking=False, delivery="inline", scope="both",
           payload=("vault", "created", "updated", "deleted", "skipped")))
 
+# What "before"/"after" are anchored to, per point. "after" is not a generic "later": post_tool is
+# after the tool returned, post_model is after the model responded, post_commit is after the commit
+# exists. The anchor is what makes the phase unambiguous.
+ANCHORS = {
+    "session": "the session lifetime",
+    "agent": "one agent invocation",
+    "turn": "one user turn",
+    "compact": "a context compaction",
+    "subagent": "one child agent run",
+    "model": "a model request and its response",
+    "model_failure": "a failed model request",
+    "tool": "one tool execution",
+    "tool_failure": "a tool that raised or returned an error",
+    "shell": "one shell command",
+    "file_read": "reading a file",
+    "file_edit": "editing a file",
+    "prompt": "submitting the user prompt",
+    "commit": "creating a git commit",
+    "push": "pushing to a remote",
+    "run": "one factory run",
+    "stage": "one factory stage",
+    "cron": "a scheduled tick",
+    "learn": "one learning pass",
+    "wiki": "one vault sync",
+}
+for _point, _anchor in ANCHORS.items():
+    if _point in CATALOG:
+        CATALOG[_point] = replace(CATALOG[_point], anchor=_anchor)
+
 PREFIXES = {"before_": "before", "after_": "after", "wrap_": "wrap"}
 # alias -> (point, timing): the names in each spec string are listed in the same order as timings.
 ALIASES: dict[str, tuple[str, str]] = {}
@@ -101,7 +131,7 @@ for _spec in CATALOG.values():
             ALIASES[_alias] = (_spec.point, _timing)
 # canonical point -> LangChain name for the same point, for the doc table
 TABLE = [(spec.point, " / ".join(spec.timings), spec.langchain, spec.cursor,
-          spec.blocking, spec.delivery, spec.scope, ", ".join(spec.payload))
+          spec.blocking, spec.delivery, spec.scope, ", ".join(spec.payload), spec.anchor)
          for spec in CATALOG.values()]
 
 

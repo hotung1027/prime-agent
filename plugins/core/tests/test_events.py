@@ -38,5 +38,21 @@ try:
     bus.on("tool", timing="after_") if False else bus.on("commit", timing="wrap")(lambda e, n: n())
     check("unsupported timing refused", False)
 except ValueError as e: check("unsupported timing refused", "does not support" in str(e))
+# anchors: every point states what its phase is relative to
+missing = [p for p, sp in ev.CATALOG.items() if not sp.anchor]
+check("every point declares an anchor", not missing, str(missing))
+check("tool anchor is the tool execution", "tool execution" in ev.CATALOG["tool"].anchor)
+check("model anchor is the request/response", "response" in ev.CATALOG["model"].anchor)
+
+# after cannot block: it is normalised to escalate
+import asyncio
+async def after_semantics():
+    bus.reset()
+    bus.on("commit", timing="after", delivery="inline")(lambda e: bus.Verdict.block("too late"))
+    return await bus.dispatch(bus.Event("commit", {"sha": "abc"}))
+v = asyncio.run(after_semantics())
+check("after-hook block becomes escalate", v[0].verdict == "escalate" and "after-hook" in v[0].reason, str((v[0].verdict, v[0].reason)))
+bus.reset()
+
 print(f"\n{sum(1 for _,c,_ in ok if c)}/{len(ok)} checks passed")
 sys.exit(0 if all(c for _,c,_ in ok) else 1)

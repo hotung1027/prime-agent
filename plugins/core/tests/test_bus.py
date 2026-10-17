@@ -57,11 +57,11 @@ async def main():
     async def transport(event, handler):
         seen.append(event.name); return bus.Verdict.allow("started")
     bus.set_durable_transport(transport)
-    bus.on("turn_end", delivery="durable")(lambda e: bus.Verdict.allow())
-    v = await bus.dispatch(bus.Event("turn_end", {"n": 1}))
-    check("durable transport invoked", seen == ["turn_end"] and v[0].verdict == "allow", str(seen))
+    bus.on("turn", timing="before", delivery="durable")(lambda e: bus.Verdict.allow())
+    v = await bus.dispatch(bus.Event("turn", {"n": 1}))
+    check("durable transport invoked", seen == ["turn"] and v[0].verdict == "allow", str(seen))
     bus.set_durable_transport(None)
-    v = await bus.dispatch(bus.Event("turn_end", {"n": 2}))
+    v = await bus.dispatch(bus.Event("turn", {"n": 2}))
     check("missing durable transport blocks loudly", v[0].verdict == "block" and "transport" in v[0].reason)
     bus.reset()
 

@@ -352,7 +352,13 @@ async def dispatch(event: Event, *, operation=None, max_depth: int = MAX_DEPTH) 
         results.append(await chain())
 
     for handler in after:
-        results.append(await _invoke(event, handler))
+        verdict = await _invoke(event, handler)
+        if verdict.verdict == "block":
+            # the operation already ran; an after-hook cannot un-run it, and recording a "block" would
+            # let a post-hook pretend it prevented something.
+            verdict.verdict = "escalate"
+            verdict.reason = f"after-hook: {verdict.reason}" if verdict.reason else "after-hook"
+        results.append(verdict)
 
     for verdict in list(results):
         if verdict.continuation is not None:
