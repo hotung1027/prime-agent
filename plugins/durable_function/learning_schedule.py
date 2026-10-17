@@ -162,3 +162,96 @@ async def signal_turn(client: Client, session_id: str, *, kind: str = "turn", to
     handle = client.get_workflow_handle(f"learn-{session_id}")
     await handle.signal(LearningWorkflow.add_turn, {"tokens": int(tokens), "kind": kind})
     return True
+
+
+# --------------------------------------------------------------------------------------------------
+# The fingerprint gate: a scheduled loop, keyed by inputs. No signal required, so nobody has to
+# remember to announce a turn - and an unchanged tick never reaches a model.
+
+@dataclass
+class GateConfig:
+    session_id: str
+    interval_s: int = 300          # wake every 5 minutes
+    session_dir: str = ""
+    global_: bool = False
+    min_turns: int = 8
+    min_corrections: int = 1
+    min_tokens: int = 0
+    max_idle_passes: int = 0       # 0 = run until closed
+
+
+@dataclass
+class GateRequest:
+    session_id: str
+    session_dir: str
+    min_turns: int
+    min_corrections: int
+    min_tokens: int
+
+
+@activity.defn
+async def fingerprint_activity(req: GateRequest) -> dict:
+    import fingerprint
+    return fingerprint.fingerprint(req.session_id, session_dir=req.session_dir or None,
+                                   min_turns=req.min_turns, min_corrections=req.min_corrections,
+                                   min_tokens=req.min_tokens)
+
+
+@activity.defn
+async def distill_activity(req: GateRequest) -> dict:
+    import declutter
+    import fingerprint
+    result = await declutter.run(req.session_id, session_dir=req.session_dir or None)
+    fingerprint.reset_counters(req.session_id)
+    return result
+
+
+@workflow.defn
+class FingerprintGateWorkflow:
+    """Wake on a timer, fingerprint the inputs, distil only when they changed and the data is enough."""
+
+    def __init__(self):
+        self.passes = 0
+        self.distills = 0
+        self.skipped_unchanged = 0
+        self.skipped_small = 0
+        self.closed = False
+        self.last = None
+
+    @workflow.signal
+    async def close(self, reason: str = ""):
+        self.closed = True
+
+    @workflow.query
+    def status(self) -> dict:
+        return {"passes": self.passes, "distills": self.distills,
+                "skipped_unchanged": self.skipped_unchanged, "skipped_small": self.skipped_small,
+                "closed": self.closed, "last": self.last}
+
+    @workflow.run
+    async def run(self, cfg: GateConfig) -> dict:
+        req = GateRequest(session_id=cfg.session_id, session_dir=cfg.session_dir,
+                          min_turns=cfg.min_turns, min_corrections=cfg.min_corrections,
+                          min_tokens=cfg.min_tokens)
+        while not self.closed:
+            await workflow.sleep(timedelta(seconds=max(1, cfg.interval_s)))
+            if self.closed:
+                break
+            fp = await workflow.execute_activity(
+                fingerprint_activity, req, start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=RetryPolicy(maximum_attempts=2))
+            self.passes += 1
+            self.last = fp.get("conv_hash")
+            if not fp.get("changed"):
+                self.skipped_unchanged += 1
+                continue
+            if not fp.get("enough"):
+                self.skipped_small += 1
+                continue
+            await workflow.execute_activity(
+                distill_activity, req, start_to_close_timeout=timedelta(minutes=20),
+                retry_policy=RetryPolicy(maximum_attempts=2))
+            self.distills += 1
+            if cfg.max_idle_passes and self.passes >= cfg.max_idle_passes:
+                break
+        return {"passes": self.passes, "distills": self.distills, "reason": "closed" if self.closed else "budget"}
