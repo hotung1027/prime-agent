@@ -171,7 +171,10 @@ async def signal_turn(client: Client, session_id: str, *, kind: str = "turn", to
 @dataclass
 class GateConfig:
     session_id: str
-    interval_s: int = 300          # wake every 5 minutes
+    base_interval_s: int = 5       # first tick after activity
+    max_interval_s: int = 86400    # cap: one day, for a machine that was off for days
+    backoff: float = 2.0           # 5s -> 10s -> 20s -> 40s -> 80s -> 160s -> ... -> cap
+    interval_s: int = 0            # legacy alias for base_interval_s
     session_dir: str = ""
     global_: bool = False
     min_turns: int = 8
@@ -216,27 +219,49 @@ class FingerprintGateWorkflow:
         self.skipped_unchanged = 0
         self.skipped_small = 0
         self.closed = False
+        self.nudged = False
+        self.nudges = 0
+        self.interval = 0.0
         self.last = None
 
     @workflow.signal
     async def close(self, reason: str = ""):
         self.closed = True
 
+    @workflow.signal
+    async def nudge(self):
+        """Something happened in this session: check now instead of waiting out the backoff."""
+        self.nudged = True
+        self.nudges += 1
+
     @workflow.query
     def status(self) -> dict:
         return {"passes": self.passes, "distills": self.distills,
                 "skipped_unchanged": self.skipped_unchanged, "skipped_small": self.skipped_small,
-                "closed": self.closed, "last": self.last}
+                "closed": self.closed, "last": self.last,
+                "interval": round(self.interval, 3), "nudges": self.nudges}
 
     @workflow.run
     async def run(self, cfg: GateConfig) -> dict:
         req = GateRequest(session_id=cfg.session_id, session_dir=cfg.session_dir,
                           min_turns=cfg.min_turns, min_corrections=cfg.min_corrections,
                           min_tokens=cfg.min_tokens)
+        base = float(cfg.base_interval_s or cfg.interval_s or 5)
+        self.interval = base
         while not self.closed:
-            await workflow.sleep(timedelta(seconds=max(1, cfg.interval_s)))
+            # Wake on a nudge OR when the backoff interval elapses, whichever comes first. A machine
+            # that has been idle for days polls at most once a day; the moment the session sees a new
+            # turn the signal wakes it immediately, so returning from an absence is not delayed.
+            try:
+                await workflow.wait_condition(
+                    lambda: self.nudged or self.closed, timeout=timedelta(seconds=self.interval))
+            except TimeoutError:
+                pass
             if self.closed:
                 break
+            if self.nudged:
+                self.nudged = False
+                self.interval = base          # activity: check often again
             fp = await workflow.execute_activity(
                 fingerprint_activity, req, start_to_close_timeout=timedelta(minutes=5),
                 retry_policy=RetryPolicy(maximum_attempts=2))
@@ -244,7 +269,10 @@ class FingerprintGateWorkflow:
             self.last = fp.get("conv_hash")
             if not fp.get("changed"):
                 self.skipped_unchanged += 1
+                # nothing moved: back off, capped, so an untouched machine costs almost nothing
+                self.interval = min(self.interval * cfg.backoff, float(cfg.max_interval_s))
                 continue
+            self.interval = base              # something changed: watch closely again
             if not fp.get("enough"):
                 self.skipped_small += 1
                 continue
