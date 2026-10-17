@@ -25,7 +25,7 @@ async def main():
     try:
         bus.on("tool_end")(lambda e: None); check("tool event without matcher refused", False)
     except ValueError as exc:
-        check("tool event without matcher refused", "matcher" in str(exc), str(exc))
+        check("tool event without matcher refused", "filter" in str(exc) or "matcher" in str(exc), str(exc))
 
     # 3. depth guard
     deep = bus.Event("commit", {"loc": 1}, depth=4)

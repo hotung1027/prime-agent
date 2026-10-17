@@ -27,6 +27,16 @@ Canonical events are **points** (`tool`, `model`, `commit`); the *timing* is a s
 | `learn` | before / after | one learning pass | no | durable | global | — |
 | `wiki` | before / after | one vault sync | no | inline | both | — |
 
+## Subscribe
+
+```python
+bus.add("tool",  callback=lint,       timing="before", when=r"^git ")
+bus.add("tool",  callback=on_result,  timing="after")
+bus.add("model", callback=audit,      timing="wrap")
+bus.add("commit", callback=size_gate, timing="before", delivery="subprocess",
+        script=".githooks/check_commit_size.sh")
+```
+
 ## Phase semantics
 
 `before`, `wrap` and `after` are **relative to the point's anchor**, and the anchor differs per point:

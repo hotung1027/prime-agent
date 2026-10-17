@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +50,15 @@ class Event:
         """A derived event: same root, deeper, causally linked."""
         return Event(name=name, attrs=attrs, session=self.session, root_id=self.root_id or self.key(),
                      causation_id=self.key(), depth=self.depth + 1, ts=time.time())
+
+    def text(self) -> str:
+        """The string a regex filter matches against: the natural command/tool/message field,
+        falling back to the canonical JSON of the attributes."""
+        for key in ("command", "cmd", "tool", "message"):
+            value = self.attrs.get(key)
+            if value:
+                return value if isinstance(value, str) else json.dumps(value, default=str)
+        return json.dumps(self.attrs, sort_keys=True, default=str)
 
     def key(self) -> str:
         blob = json.dumps({"n": self.name, "a": self.attrs, "s": self.session}, sort_keys=True,
@@ -130,37 +140,51 @@ def reset():
     _HANDLERS.clear(); _SEEN.clear(); _SPEND.clear(); _SCRIPT_ALLOWLIST.clear()
 
 
-def on(name: str, *, when=None, delivery: str | None = None, budget: Budget | None = None,
+def on(name: str, *, when=None, delivery: str | None = None, budget: "Budget | None" = None,
        script: str = "", timing: str | None = None, priority: int = 50, scope: str = "both"):
-    """Register a handler.
+    """Decorator form of add(): `@bus.on("tool", when=...)` -> `bus.add("tool", callback=fn, ...)`."""
+    def register(fn):
+        return add(name, fn, timing=timing, when=when, delivery=delivery, priority=priority,
+                   scope=scope, budget=budget, script=script)
+    return register
 
-    `name` may be a canonical point (`tool`, `commit`), a timing alias (`before_tool`, `wrap_tool`),
-    or a LangChain/Cursor name (`preToolUse`, `wrap_model_call`). The catalog resolves it and rejects
-    an unknown point, an unsupported timing, or a global event registered per project.
+
+def _matcher(when, point: str):
+    """None -> no filter (only allowed outside MATCHER_REQUIRED); callable; regex; or {field: regex}."""
+    if when is None:
+        if point in MATCHER_REQUIRED:
+            raise ValueError(f"event {point!r} needs a filter (`when=`): an unmatched event fires "
+                             f"dozens of times per turn")
+        return None
+    if callable(when):
+        return when
+    if isinstance(when, (str, re.Pattern)):
+        pattern = re.compile(when)
+        return lambda event: bool(pattern.search(event.text()))
+    if isinstance(when, dict):
+        patterns = {k: re.compile(v) for k, v in when.items()}
+        return lambda event: all(p.search(str(event.attrs.get(k, ""))) for k, p in patterns.items())
+    raise ValueError(f"unsupported `when=` {type(when).__name__}; expected callable, regex or dict")
+
+
+def add(event: str, callback, *, timing: str | None = None, when=None, delivery: str | None = None,
+        priority: int = 50, scope: str = "both", budget: "Budget | None" = None, script: str = ""):
+    """Subscribe a callback to an event.  bus.add("tool", callback=lint, timing="before", when=r"^git ")
+
+    `when` is the filter: a callable(event)->bool, a regex matched against `event.text()` (the command,
+    tool name or message), or a {field: regex} dict. It is mandatory for high-frequency points.
     """
-    name, timing = _events.resolve(name, timing, scope)
-    spec = _events.CATALOG[name]
-    # The catalog's `delivery` is the default for config-file hooks; an explicit registration is
-    # inline unless it says otherwise. Silently turning on("commit") into a subprocess would surprise.
-    delivery = delivery or "inline"
+    point, timing = _events.resolve(event, timing, scope)
     if timing == "wrap":
         delivery = "wrap"
+    delivery = delivery or "inline"
     if delivery not in DELIVERIES:
         raise ValueError(f"unknown delivery {delivery!r}; expected one of {DELIVERIES}")
-    if timing not in ("before", "wrap", "after"):
-        raise ValueError(f"unknown timing {timing!r}; expected before | wrap | after")
-    if timing == "wrap":
-        delivery = "wrap"          # a wrap receives (event, next) - it is a delivery, not a timing flag
-    if when is None and name in MATCHER_REQUIRED:
-        raise ValueError(f"event {name!r} needs a matcher (`when=`): an unmatched tool event "
-                         f"fires dozens of times per turn")
-
-    def register(fn):
-        _HANDLERS.append(Handler(name=name, fn=fn, when=when, delivery=delivery,
-                                 budget=budget or Budget(), id=getattr(fn, "__qualname__", repr(fn)),
-                                 script=script, timing=timing, priority=priority))
-        return fn
-    return register
+    handler = Handler(name=point, fn=callback, when=_matcher(when, point), delivery=delivery,
+                      budget=budget or Budget(), id=getattr(callback, "__qualname__", repr(callback)),
+                      script=script, timing=timing, priority=priority)
+    _HANDLERS.append(handler)
+    return callback
 
 
 def allow_script(path, sha256: str):
