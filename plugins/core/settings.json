@@ -1,0 +1,64 @@
+{
+ "default": "openrouter/deepseek/deepseek-v4.1-flash",
+ "reviewer": null,
+ "gates": null,
+ "roles": {
+  "planner": [
+   "openrouter/xiaomi/mimo-v2.6-pro",
+   "openrouter/z-ai/glm-5.3-flash"
+  ],
+  "reviewer": [
+   "openrouter/z-ai/glm-5.3-flash",
+   "openrouter/xiaomi/mimo-v2.6-pro"
+  ],
+  "verifier": [
+   "openrouter/xiaomi/mimo-v2.6-pro",
+   "openrouter/z-ai/glm-5.3-flash"
+  ],
+  "security": [
+   "openrouter/z-ai/glm-5.3-flash",
+   "openrouter/xiaomi/mimo-v2.6-pro"
+  ],
+  "profiling": [
+   "openrouter/z-ai/glm-5.3-flash",
+   "openrouter/xiaomi/mimo-v2.6-pro"
+  ],
+  "researcher": {
+   "scientific": [
+    "openrouter/xiaomi/mimo-v2.6-pro",
+    "openrouter/z-ai/glm-5.3-flash"
+   ],
+   "websearch": [
+    "openrouter/deepseek/deepseek-v4.1-flash"
+   ],
+   "default": [
+    "openrouter/xiaomi/mimo-v2.6-pro",
+    "openrouter/z-ai/glm-5.3-flash"
+   ]
+  },
+  "implementer": [
+   "openrouter/deepseek/deepseek-v4.1-flash",
+   "openrouter/xiaomi/mimo-v2.6-pro"
+  ],
+  "documentator": [
+   "openrouter/deepseek/deepseek-v4.1-flash",
+   "openrouter/z-ai/glm-5.3-flash"
+  ],
+  "cicd": [
+   "openrouter/deepseek/deepseek-v4.1-flash",
+   "openrouter/z-ai/glm-5.3-flash"
+  ],
+  "infrastructure": [
+   "openrouter/deepseek/deepseek-v4.1-flash",
+   "openrouter/z-ai/glm-5.3-flash"
+  ],
+  "visual": [
+   "openrouter/deepseek/deepseek-v4.1-flash"
+  ],
+  "decision": [
+   "openrouter/typesafe/jev-1.13"
+  ]
+ },
+ "decision_api": "alpha",
+ "decision_rule": "both"
+}
