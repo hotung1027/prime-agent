@@ -515,6 +515,28 @@ class ReplTest(unittest.TestCase):
             time.sleep(1.6)
             self.assertFalse(os.path.exists(marker))
 
+    def test_interrupted_await_inside_bounded_window_still_kills(self):
+        # The bounded wait observes an interrupt instead of abandoning on it:
+        # inside the window the owned await keeps its kill-on-cancel contract.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "marker")
+            code = "\n".join(
+                [
+                    "import rlm",
+                    "rlm._set_completion_notices_wired(True)",
+                    "from rlm import bash",
+                    f"r = await bash('sleep 1.5 && touch {marker}')",
+                ]
+            )
+            self.repl.send({"type": "execute", "id": "ibash-bounded", "code": code})
+            time.sleep(0.4)
+            self.repl.send({"type": "interrupt"})
+            events = self.repl.until_done("ibash-bounded")
+            self.assertEqual(one(events, "error")["ename"], "KeyboardInterrupt")
+            self.assertEqual(one(events, "done")["status"], "error")
+            time.sleep(1.6)
+            self.assertFalse(os.path.exists(marker))
+
     def _interrupt_after_running(self, rid: str, code: str) -> list[dict]:
         self.repl.send({"type": "execute", "id": rid, "code": code})
         # Give the cell time to enter its blocking region before interrupting.
@@ -797,6 +819,46 @@ class ReplTest(unittest.TestCase):
             events = fresh.execute("wakeup-probe", probe)
             self.assertEqual(one(events, "done")["status"], "ok")
             self.assertEqual(one(events, "result")["text"], "'woken'")
+
+    def test_restore_never_reopens_pickled_file_handles(self):
+        # dill saves a file object as (name, mode) and its revival reopens the
+        # path with that mode: "w" truncated the user's file on every restore
+        # even when the handle was closed (discussion #3085).
+        sys.path.insert(0, SRC)
+        self.addCleanup(sys.path.remove, SRC)
+        from rlm import repl as repl_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "notes.txt")
+            handle = open(target, "w")
+            handle.close()
+            with open(target, "w") as fh:
+                fh.write("precious")
+            # A handle nested in a container takes the same reconstructor.
+            ns = {"handle": handle, "nested": {"inner": [handle]}}
+            path = os.path.join(tmp, "state", "kernel-state.dill")
+            manifest_path = os.path.join(tmp, "state", "kernel-state.json")
+            result = repl_module._snapshot_state(
+                ns,
+                path,
+                manifest_path,
+                repl_module.DEFAULT_SNAPSHOT_MAX_BYTES,
+                repl_module.DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
+                False,
+            )
+            self.assertEqual(result["saved"], ["handle", "nested"])
+
+            restored_ns = {}
+            result = repl_module._restore_state(restored_ns, path)
+            self.assertEqual((result["restored"], result["failed"]), (["handle", "nested"], []))
+            with open(target) as fh:
+                self.assertEqual(fh.read(), "precious")
+            restored = restored_ns["handle"]
+            self.assertEqual((restored.name, restored.mode, restored.closed), (target, "w", True))
+            self.assertIsInstance(restored_ns["nested"]["inner"][0], repl_module._RestoredFileStub)
+            for call in (lambda: restored.write("x"), restored.read, restored.readline):
+                with self.assertRaisesRegex(ValueError, "closed file"):
+                    call()
 
     def test_stdin_eof_flushes_final_snapshot(self):
         # Host death (EOF, no shutdown request) must persist the namespace
@@ -1153,6 +1215,70 @@ class ReplTest(unittest.TestCase):
         reply_ok(self.repl, request)
         inspected = self.repl.execute("bash-inspect", "handle.poll().output")
         self.assertIn("detached", one(inspected, "result")["text"])
+
+    def test_degraded_await_in_creating_cell_still_sends_bash_completion(self):
+        # A bounded await that degrades inside the creating cell must count as
+        # neither awaited nor consumed, or the [bash-done] notice (the only
+        # wake-up) would never fire.
+        code = "\n".join(
+            [
+                "import rlm",
+                "rlm._set_completion_notices_wired(True)",
+                "from rlm import bash",
+                "handle = bash('sleep 1.5; printf degraded')",
+                "await handle",
+                "handle.pid",
+            ]
+        )
+        events = self.repl.execute("bash-degrade", code)
+        pid = int(one(events, "result")["text"])
+        request = wait_for_host_request(self.repl, events)
+        self.assertEqual(
+            request["data"],
+            {
+                "type": "bash.completed",
+                "pid": pid,
+                "command": "sleep 1.5; printf degraded",
+                "exitCode": 0,
+            },
+        )
+        reply_ok(self.repl, request)
+
+    def test_degraded_await_of_a_persistent_shell_keeps_it_running_to_its_notice(self):
+        # The yield window and persistent= compose: the persistent handle's await
+        # degrades like any handle's, and the shell (never owned by an await)
+        # runs on to its [bash-done] notice.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        repl = ReplProcess(
+            env={"PRIME_AGENT_CODING_AGENT_DIR": temp.name, "RLM_SESSION_ID": "own-session"}
+        )
+        self.addCleanup(repl.close)
+        repl.ready()
+        code = "\n".join(
+            [
+                "import rlm",
+                "rlm._set_completion_notices_wired(True)",
+                "from rlm import bash",
+                "handle = bash('sleep 1.5; printf persisted', persistent=True)",
+                "snapshot = await handle",
+                "(snapshot.running, snapshot.handle is handle, handle.pid)",
+            ]
+        )
+        events = repl.execute("persistent-degrade", code)
+        running, same, pid = one(events, "result")["text"].strip("()").split(", ")
+        self.assertEqual((running, same), ("True", "True"))
+        request = wait_for_host_request(repl, events)
+        self.assertEqual(
+            request["data"],
+            {
+                "type": "bash.completed",
+                "pid": int(pid),
+                "command": "sleep 1.5; printf persisted",
+                "exitCode": 0,
+            },
+        )
+        reply_ok(repl, request)
 
     def test_result_read_after_notice_requests_one_withdrawal(self):
         reads = (

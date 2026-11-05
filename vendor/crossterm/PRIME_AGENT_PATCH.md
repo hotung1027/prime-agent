@@ -61,3 +61,34 @@ the enhancement for the RTT>50ms class (the product's primary remote-SSH
 deployment shape) while buying only the silent class's raced-transition
 stall, which no user rides. The timed contract is locked by
 `crates/pa-cli/tests/kitty_verdict_time_e2e.rs`.
+
+# Every readiness token of a poll is handled (2026-10-21)
+
+`src/event/source/unix/mio.rs` `try_read` returned on the first token that produced an event and
+dropped the rest of that poll's tokens. mio registers edge-triggered, so when a resize and a
+keystroke landed in the same poll, one of them was lost (the
+`scripts/check_private_default_frames.py` flake). Now tty input and the resize queue in token order,
+a wake still returns `Interrupted` with the input kept queued, and the blocking tty read is
+unchanged. Upstream crossterm has the same code.
+
+The test is an inline `#[cfg(test)]` module because only it can reach the private
+`UnixInternalEventSource::try_read`; cargo does not test a non-member crate in place, so run it from
+a copy of `vendor/crossterm` without the `[[example]]` entries (the examples are not vendored):
+`TERM=xterm-256color cargo test --features event-stream --lib -- a_keystroke_in_the_same_poll`.
+
+# A zero-timeout poll serves every queued console record on Windows (2026-10-23)
+
+`src/event/source/windows.rs` `try_read` checked its timeout after every record, including records
+that map to no event (the `VK_SHIFT`/`VK_CONTROL`/`VK_MENU` key records the console synthesizes
+around each shifted character of a paste). A `poll(Duration::ZERO)` therefore returned `false`
+while input was still queued, and the app reader (`crates/pa-tui/src/input.rs`), which drains one
+terminal write per round until that poll says empty, split a pasted line at its first capital.
+Now a record that produces no event loops straight to the next one while the console still holds
+records; the timeout applies only when the buffer is empty. Upstream crossterm has the same code.
+
+# Alt+numpad characters are presses on Windows (2026-10-28)
+
+`src/event/sys/windows/parse.rs` receives a completed Alt+numpad character on the Alt key-up
+record. The inbox console also uses those records for pasted characters absent from the active
+keyboard layout. Report the character as a press, like the surrogate path, so consumers that drop
+key releases retain it. Ordinary key-up records still report releases.

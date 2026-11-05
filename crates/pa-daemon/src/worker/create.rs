@@ -179,6 +179,9 @@ impl Worker {
                 }
                 _ => (None, None, None, None),
             };
+        let factory_child = payload
+            .get("runtimeMetadata")
+            .is_some_and(|metadata| metadata.get("factory").is_some());
         let thinking = payload
             .get("thinking")
             .and_then(Value::as_str)
@@ -384,6 +387,11 @@ impl Worker {
                 );
             }
         };
+        // The worker owns the session file; the engine reads it for the
+        // system prompt's conversation-log path and the local harness dir.
+        if !store.path.as_os_str().is_empty() {
+            self.engine.set_session_file(store.path.clone());
+        }
 
         // The `models` patterns (else settings `enabledModels`) resolve once into
         // the scoped list, AFTER the store open (the saved-model restore's wait
@@ -394,21 +402,29 @@ impl Worker {
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect::<Vec<String>>(),
-            None => pa_core::settings::SettingsManager::create(&cwd, &self.config.agent_dir)
-                .get_enabled_models()
-                .unwrap_or_default(),
+            None => settings.get_enabled_models().unwrap_or_default(),
         };
+        let is_continuing = opened_existing_session;
         let scoped_models = if model_patterns.is_empty() {
             Vec::new()
         } else {
-            let registry = crate::state_getters::worker_model_registry(&self.config.agent_dir);
-            let available: Vec<pa_types::ai::Model> =
-                registry.get_available().into_iter().cloned().collect();
-            pa_core::models::resolve_model_scope_from_models(&model_patterns, &available)
+            let mut registry = crate::state_getters::worker_model_registry(&self.config.agent_dir);
+            pa_core::models::resolve_model_scope_from_models_with_readiness(
+                &mut registry,
+                &model_patterns,
+                settings
+                    .get_default_provider()
+                    .zip(settings.get_default_model()),
+                is_continuing,
+                pa_core::models::SESSION_MODEL_RESTORE_READINESS_TIMEOUT_MS,
+            )
+            .await
         };
-        let is_continuing = opened_existing_session;
-        self.engine
-            .configure_startup_scope(scoped_models.clone(), is_continuing);
+        self.engine.configure_startup_scope(
+            scoped_models.clone(),
+            model_patterns.clone(),
+            is_continuing,
+        );
         // The fresh arms' deferred creation prefix runs here, against the
         // registered scope; the continuing arm wrote its own prefix above, so
         // the scope never changes a continuing file's pinned model and thinking.
@@ -469,18 +485,13 @@ impl Worker {
         }
         // Restore the persisted queue snapshot (crash/respawn recovery) from
         // the worker recovery journal.
-        let (steering, follow_up) = {
+        let (steering, follow_up, restored_suspended) = {
             let guard = self.recovery.lock().unwrap();
             match guard.as_ref() {
                 Some(journal) => restore_queue_snapshot(journal, &self.config.active_session_id),
-                None => (VecDeque::new(), VecDeque::new()),
+                None => (VecDeque::new(), VecDeque::new(), false),
             }
         };
-        // The worker owns the session file; the engine reads it for the
-        // system prompt's conversation-log path and the local harness dir.
-        if !store.path.as_os_str().is_empty() {
-            self.engine.set_session_file(store.path.clone());
-        }
         // The session's settings-seeded switches: a restarted session re-seeds
         // its auto-compaction flag from the persisted `compaction.enabled`.
         let (service_tier, steering_mode, follow_up_mode, auto_compaction_enabled) = {
@@ -519,6 +530,12 @@ impl Worker {
             core.cwd = cwd;
             core.steering = steering;
             core.follow_up = follow_up;
+            // The restored lanes carry their suspension: a user-aborted queue
+            // revives still parked, never auto-running its prompts.
+            core.queued_input_suspended = restored_suspended;
+            // A resumed session's tool counter re-seeds from its file: a
+            // revived worker keeps the count its roster rows carried.
+            core.tool_use_count = store.tool_call_count();
             core.store = Some(store);
             if let Some(disclosure) = &interrupted_compaction {
                 if let Some(store) = core.store.as_mut() {
@@ -540,6 +557,8 @@ impl Worker {
             }
             core.created = true;
             core.abort_requested = false;
+            core.turn_cancelled = false;
+            core.turn_completed = false;
             // A fresh session starts live: the previous close's
             // `session_closed` marker clears with the new session.
             if let Some(agent_engine) = &self.agent_engine {
@@ -550,7 +569,10 @@ impl Worker {
             core.active_service_tier = clamped_tier;
             core.steering_mode.clone_from(&steering_mode);
             core.follow_up_mode.clone_from(&follow_up_mode);
-            core.forced_all_steering = false;
+            // The restored rows carry their forced-batch flag: the batch
+            // gate rides the lane, so a restored forced batch keeps its
+            // one-turn semantics.
+            core.forced_all_steering = core.steering.iter().any(|item| item.forced_batch);
             core.scoped_models.clone_from(&scoped_entries);
             core.retry_abort_requested = false;
             // The session's depth falls back to the opened file's header: a resumed
@@ -586,6 +608,7 @@ impl Worker {
             thinking,
             child_script: child_script.clone(),
             semantic_spawn,
+            factory_child,
         }) {
             return response_failure(None, "create", &error.to_string(), None);
         }

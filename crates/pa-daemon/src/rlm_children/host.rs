@@ -4,12 +4,13 @@
 //! with the spawn-admission helpers only this surface uses.
 use super::{
     assert_thinking_supported, bail, create_default_rlm_subagent_session_name, json, now_ms,
-    resolve_child_model, rlm_child_label, rlm_depth_limit_error, spawn_name_unavailable_error, Arc,
-    ChildCloseReason, ChildRecord, Context, DaemonCommand, Duration, Instant, Mutex, Path, PathBuf,
-    Result, RlmChildResult, RlmCreateSessionHandle, RlmCreateSessionRequest,
-    RlmDeleteSubagentResult, RlmHostFuture, RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry,
-    RlmSubagentHost, SpawnNameReservationGuard, SupervisorChildSessions,
-    SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS, RENAME_TIMEOUT_MS,
+    resolve_child_cwd, resolve_child_model, rlm_child_label, rlm_depth_limit_error,
+    spawn_name_unavailable_error, Arc, ChildCloseReason, ChildObservationSource, ChildRecord,
+    Context, DaemonCommand, Duration, Instant, Mutex, Path, Result, RlmChildResult,
+    RlmCreateSessionHandle, RlmCreateSessionRequest, RlmDeleteSubagentResult, RlmHostFuture,
+    RlmSpawnHandle, RlmSpawnRequest, RlmSubagentEntry, RlmSubagentHost, SpawnNameReservationGuard,
+    SupervisorChildSessions, SupervisorChildSessionsInner, Value, KILL_TIMEOUT_MS,
+    RENAME_TIMEOUT_MS, STATE_TIMEOUT_MS,
 };
 
 /// Resolve the child model with the daemon `allowedModels` allowlist enforced, refusing loudly with
@@ -120,14 +121,22 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
                 let thinking = request.thinking.as_deref().or(identity.thinking.as_deref());
                 let child_dir = this.child_session_dir(&child_id, &identity)?;
-                let cwd = identity.cwd.clone().unwrap_or_else(|| "/".to_string());
-                let runtime_metadata = json!({
+                let cwd = resolve_child_cwd(
+                    Path::new(identity.cwd.as_deref().unwrap_or("/")),
+                    request.cwd.as_deref(),
+                    "rlm.spawn",
+                )?;
+                let mut runtime_metadata = json!({
                     "kind": "subagent",
                     "rlmChildId": child_id,
                     "parentActiveSessionId": this.parent_active_session_id,
                     "rlmDepth": identity.rlm_depth + 1,
                     "createdAt": now_ms(),
                 });
+                // The admission's ledger spawn record reads the run tag back.
+                if let Some(factory) = &request.factory {
+                    runtime_metadata["factory"] = json!(factory);
+                }
                 let created = this
                     .create_child(
                         &child_id,
@@ -136,7 +145,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         identity.rlm_depth + 1,
                         &model,
                         thinking,
-                        &cwd,
+                        &cwd.to_string_lossy(),
                         &child_dir,
                         request.spawned_by_request_id.as_deref(),
                         Some(runtime_metadata),
@@ -164,10 +173,16 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     answer_text: None,
                     answer_captured: false,
                     replied_since_task: false,
+                    progress_note: None,
+                    tool_use_count: None,
+                    live_observation: None,
+                    direct_observation: Arc::new(Mutex::new(())),
                     notice_delivered: false,
+                    factory: request.factory.is_some(),
                     prompt_admitted: false,
                     error: None,
                     closed_by_parent: false,
+                    retiring: false,
                     retirement_finished: false,
                     retirement_notified: false,
                     retirement_roster_emitted: false,
@@ -233,19 +248,26 @@ impl RlmSubagentHost for SupervisorChildSessions {
             let child_active_session_id = created.active_session_id.clone();
             let child_session_file = created.session_file.clone();
             let child_log_id = child_id.clone();
-            // Capture the current turn boundary before detaching: spawn
-            // admission happens mid-turn, so the parent's continuation
-            // request reaches the provider first (see `wait_turn_done`).
-            let turn_generation = *this.turn_done.subscribe().borrow();
+            // Capture the spawning turn before detaching: a spawn admitted
+            // mid-turn prompts after that turn completes, so the parent's
+            // continuation request reaches the provider first (see
+            // `wait_turn_done`). A spawn admitted while the parent is idle
+            // (a background kernel task, e.g. a factory run) has no turn
+            // to wait for.
+            let spawning_turn = {
+                let turn = *this.parent_turn.borrow();
+                turn.running.then_some(turn.completed)
+            };
             tokio::spawn(async move {
-                watcher_this.wait_turn_done(turn_generation).await;
+                if let Some(generation) = spawning_turn {
+                    watcher_this.wait_turn_done(generation).await;
+                }
                 // The parent closed before the prompt admitted: the
                 // child is closed with it, so the detached task prompt
                 // never fires.
                 if watcher_record.lock().await.closed_by_parent {
                     return;
                 }
-                watcher_record.lock().await.prompt_admitted = true;
                 if let Err(error) = watcher_this
                     .prompt_child(
                         &child_active_session_id,
@@ -281,15 +303,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
                             .kill_child(&child_active_session_id, ChildCloseReason::Killed)
                             .await;
                         watcher_this
-                            .settle_failed(
-                                &watcher_record,
-                                format!("{retry_error:#}"),
-                                super::lifecycle::FailedArm::Prompt,
-                            )
+                            .settle_failed(&watcher_record, format!("{retry_error:#}"))
                             .await;
                         return;
                     }
                 }
+                // The worker accepted the task: from here an idle read is a
+                // finished run, never the pre-prompt idle worker.
+                watcher_record.lock().await.prompt_admitted = true;
                 watcher_this.watch_child_settle(&watcher_record).await;
             });
             Ok(RlmSpawnHandle {
@@ -321,11 +342,11 @@ impl RlmSubagentHost for SupervisorChildSessions {
             assert_thinking_supported(&this.agent_dir, request.thinking.as_deref(), &model)?;
             // A depth-0 resident session is created exactly like a client
             // `create`: the shared sessions dir and the requested cwd.
-            let cwd = match &request.cwd {
-                Some(cwd) if Path::new(cwd).is_absolute() => PathBuf::from(cwd),
-                Some(cwd) => Path::new(identity.cwd.as_deref().unwrap_or("/")).join(cwd),
-                None => PathBuf::from(identity.cwd.clone().unwrap_or_else(|| "/".to_string())),
-            };
+            let cwd = resolve_child_cwd(
+                Path::new(identity.cwd.as_deref().unwrap_or("/")),
+                request.cwd.as_deref(),
+                "rlm.create_session",
+            )?;
             let sessions_dir = crate::paths::sessions_dir(&this.agent_dir)?;
             std::fs::create_dir_all(&sessions_dir)
                 .with_context(|| format!("create sessions dir {}", sessions_dir.display()))?;
@@ -372,10 +393,49 @@ impl RlmSubagentHost for SupervisorChildSessions {
         let this = Arc::clone(&self.inner);
         Box::pin(async move {
             let records = this.children.lock().await.clone();
+            // The children's live note and tool count join from the
+            // supervisor's pushed roster: one in-memory read, never a busy
+            // child worker round trip. A failed read keeps the last values
+            // each record observed; the settle watcher owns worker refreshes.
+            let request_order = this
+                .observation_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(peers) = this.child_roster_rows(&records).await {
+                for record in &records {
+                    let (rlm_child_id, active_session_id) = {
+                        let record = record.lock().await;
+                        (
+                            record.rlm_child_id.clone(),
+                            record.active_session_id.clone(),
+                        )
+                    };
+                    let live = peers
+                        .iter()
+                        .find(|row| {
+                            row.get("rlmChildId").and_then(Value::as_str)
+                                == Some(rlm_child_id.as_str())
+                        })
+                        .or_else(|| {
+                            peers.iter().find(|row| {
+                                row.get("activeSessionId").and_then(Value::as_str)
+                                    == Some(active_session_id.as_str())
+                            })
+                        });
+                    if let Some(live) = live {
+                        this.observe_live_state(
+                            record,
+                            live,
+                            request_order,
+                            ChildObservationSource::Roster,
+                        )
+                        .await;
+                    }
+                }
+            }
             let mut entries = Vec::with_capacity(records.len());
             for record in &records {
-                // The settle watcher owns worker refreshes. A roster read is a
-                // snapshot and must not queue behind a long supervisor request.
+                // A roster read is a snapshot: the rows serve the records'
+                // last observed state without another round trip.
                 let record = record.lock().await;
                 entries.push(SupervisorChildSessions::entry(&record));
             }
@@ -464,14 +524,37 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 ]),
             };
             drop(record_guard);
-            let was_running = record.lock().await.settled_status.is_none();
+            let was_running = {
+                // A delete of a LIVE run must not let a settle watcher that
+                // wakes inside the kill window append a clean
+                // `child_returned` beside the cancel line. The gate is this
+                // mark, not a fake settle: a fake settle would make the
+                // watcher treat the live run as finished and exit, which a
+                // failed kill would then strand (a live, unwatched child).
+                // A settled child's delete records no cancel line, so it
+                // leaves its return alone.
+                let mut row = record.lock().await;
+                let was_running = row.settled_status.is_none();
+                if was_running {
+                    row.retiring = true;
+                }
+                was_running
+            };
             // Capture before the kill: a deleted running child's durable
             // rows are its last observable spend on the parent side.
             if !already_terminated {
                 this.emit_child_usage(&record).await;
-                this.command(&command, KILL_TIMEOUT_MS)
+                if let Err(error) = this
+                    .command(&command, KILL_TIMEOUT_MS)
                     .await
-                    .with_context(|| format!("kill RLM child \"{target}\""))?;
+                    .with_context(|| format!("kill RLM child \"{target}\""))
+                {
+                    // The kill never landed: clear the mark so the
+                    // still-live child stays watchable and a later cancel
+                    // can still record the parent -> child edge.
+                    record.lock().await.retiring = false;
+                    return Err(error);
+                }
                 this.retain_retired_usage(&record, super::RetirementIntent::Delete { was_running });
                 // Observe any rows that landed before the acknowledged kill.
                 this.emit_child_usage(&record).await;
@@ -673,6 +756,23 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 record.lock().await.session_name = name.clone();
             }
             Ok(name)
+        })
+    }
+
+    /// The session's own worker answers, image payloads left out.
+    fn session_messages(&self, start: i64, limit: u64, roles: Vec<String>) -> RlmHostFuture<Value> {
+        let this = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let command = DaemonCommand::GetSessionMessages {
+                id: None,
+                active_session_id: this.parent_active_session_id.clone(),
+                start,
+                limit,
+                roles,
+                session_file: None,
+                rest: serde_json::Map::default(),
+            };
+            this.command(&command, STATE_TIMEOUT_MS).await
         })
     }
 }

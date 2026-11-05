@@ -6,6 +6,7 @@ pub mod agent_messaging;
 pub mod auto_refine_trigger;
 pub mod auto_retry;
 pub mod auxiliary_model;
+pub mod bash_notices;
 pub mod branch_summarization;
 pub mod compact_session;
 pub mod compaction;
@@ -22,7 +23,9 @@ pub mod headless;
 pub mod host_requests;
 pub mod image_model_routing;
 pub mod ipython_state;
+pub mod late_sent_messages;
 pub mod messages;
+pub mod model_usage;
 pub mod provider_adapter;
 pub mod provider_failover;
 pub mod provider_park;
@@ -183,6 +186,10 @@ pub struct AgentSession {
     /// resolves it (verification harnesses building the session directly
     /// keep `None`, which reads as the fail-closed disabled default).
     agent_dir: Option<std::path::PathBuf>,
+    /// Where the session's own model calls outside the agent loop record
+    /// their `model_usage` rows: the session file unless the host binds
+    /// its durable store (the daemon worker's).
+    usage_store: std::sync::Arc<dyn rlm_usage::RlmChildUsageStore>,
 }
 
 impl AgentSession {
@@ -220,6 +227,7 @@ impl AgentSession {
         harness_digest: Option<harness_digest::HarnessDigestContext>,
     ) -> anyhow::Result<Self> {
         let persistence = session.clone();
+        let usage_store = std::sync::Arc::new(rlm_usage::SessionUsageStore(session.clone()));
         agent
             .subscribe(move |event, _signal| {
                 let persistence = persistence.clone();
@@ -252,6 +260,7 @@ impl AgentSession {
             side_question_stream_fn: std::sync::Mutex::new(None),
             agent_dir: None,
             compaction_flight: tokio::sync::Mutex::new(()),
+            usage_store,
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
@@ -403,6 +412,36 @@ async fn persist_event(
             };
             if let Some(error) = write_error {
                 eprintln!("pa-core: message row not persisted: {error}");
+            }
+        }
+        // Tool-call lifecycle rows: the start and running sides of the
+        // trace (the completion side is the toolResult message row). Like
+        // the message arm, a failed durable write never fails the run.
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => {
+            let result = session
+                .lock()
+                .await
+                .append_tool_started(&tool_call_id, &tool_name, args);
+            if let Err(error) = result {
+                eprintln!("pa-core: tool_started row not persisted: {error}");
+            }
+        }
+        AgentEvent::ToolExecutionProgress {
+            tool_call_id,
+            tool_name,
+            elapsed_ms,
+        } => {
+            let result =
+                session
+                    .lock()
+                    .await
+                    .append_tool_progress(&tool_call_id, &tool_name, elapsed_ms);
+            if let Err(error) = result {
+                eprintln!("pa-core: tool_progress row not persisted: {error}");
             }
         }
         // Git state is captured at both run boundaries, exactly like the

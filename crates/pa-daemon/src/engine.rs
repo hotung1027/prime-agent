@@ -16,10 +16,10 @@ mod wire;
 pub use scripted::ScriptedEngine;
 pub(crate) use wire::session_wire_value;
 pub use wire::{
-    empty_resource_snapshot, side_question_event_value, AssistantSnapshot, BashCompletionNotice,
-    BashCompletionSink, BashConsumedNotice, BashConsumedSink, BranchSummaryOutcome,
-    BranchSummaryRequest, BranchSummaryRun, CompactionOutcome, CompactionRequest, CompactionRun,
-    EngineEvent, EngineModelSelection, GoalAdmissionSink, GoalContinuation, GoalTurnEndWork,
+    empty_resource_snapshot, side_question_event_value, AssistantSnapshot, BashConsumedNotice,
+    BashConsumedSink, BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun,
+    CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection,
+    GoalAdmissionSink, GoalContinuation, GoalTurnEndWork, KernelNotice, KernelNoticeSink,
     PromptBatchRow, PromptRequest, RlmSessionIdentity, SavedSessionContext, SemanticSpawnOrigin,
     SessionInputProbe, SideQuestionOutcome, SideQuestionRequest, SIDE_QUESTION_STATUS_CANCELLED,
     SIDE_QUESTION_STATUS_COMPLETE, SIDE_QUESTION_STATUS_ERROR, SIDE_QUESTION_STATUS_RUNNING,
@@ -193,6 +193,9 @@ pub trait SessionEngine: Send + Sync {
     fn model_context_window(&self) -> Option<u64> {
         None
     }
+    /// The worker's turn loop started: engines hosting RLM children hold
+    /// the task prompts of children spawned from here until `on_turn_done`.
+    fn on_turn_start(&self) {}
     /// The worker's turn loop completed: engines hosting RLM children
     /// release prompt tasks spawned mid-turn, so the parent's continuation
     /// request always reaches the provider before a child's first turn.
@@ -263,6 +266,7 @@ pub trait SessionEngine: Send + Sync {
     fn configure_startup_scope(
         &self,
         _scoped_models: Vec<pa_core::models::ScopedModel>,
+        _patterns: Vec<String>,
         _is_continuing: bool,
     ) {
     }

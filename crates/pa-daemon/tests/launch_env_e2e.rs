@@ -525,6 +525,9 @@ async fn an_rlm_spawn_child_inherits_the_parent_worker_env() {
             agent_dir.clone(),
             /*telemetry_disabled*/ true,
         )),
+        // This process stands in for the parent and has no worker token;
+        // this fixture reads the child's env, not authenticated roster joins.
+        String::new(),
     );
     children.set_identity(ParentIdentity {
         rlm_depth: 0,
@@ -542,7 +545,9 @@ async fn an_rlm_spawn_child_inherits_the_parent_worker_env() {
             name: Some("worker-a".to_string()),
             model: None,
             thinking: None,
+            cwd: None,
             spawned_by_request_id: None,
+            factory: None,
         })
         .await
         .expect("spawn");

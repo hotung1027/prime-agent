@@ -520,6 +520,22 @@ const WIRE_FIXTURES: &[(&str, &str)] = &[
         "mark_anthropic_warning_shown",
         r#"{"type": "mark_anthropic_warning_shown", "activeSessionId": "sess"}"#,
     ),
+    (
+        "list_persistent_shells",
+        r#"{"type": "list_persistent_shells"}"#,
+    ),
+    (
+        "tail_persistent_shell",
+        r#"{"type": "tail_persistent_shell", "shellId": "s", "lines": 50}"#,
+    ),
+    (
+        "kill_persistent_shell",
+        r#"{"type": "kill_persistent_shell", "shellId": "s"}"#,
+    ),
+    (
+        "get_session_messages",
+        r#"{"type": "get_session_messages", "activeSessionId": "sess", "start": -10, "limit": 10, "roles": ["*"]}"#,
+    ),
 ];
 
 /// The accept list is the TS list, in TS order, then the Rust-native supervisor/worker frames.
@@ -548,6 +564,10 @@ fn known_command_types_match_the_ts_list() {
                     | "tail_kernel_bash"
                     | "kill_kernel_bash"
                     | "mark_anthropic_warning_shown"
+                    | "list_persistent_shells"
+                    | "tail_persistent_shell"
+                    | "kill_persistent_shell"
+                    | "get_session_messages"
             ),
             "unexpected non-TS command type: {extra}"
         );
