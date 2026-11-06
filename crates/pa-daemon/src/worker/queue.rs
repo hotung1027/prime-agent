@@ -256,7 +256,7 @@ pub(crate) fn checkpoint_queue_recovery(
     };
     // The lanes are read under the recovery lock (a microsecond core hold —
     // never across the journal's fsyncs): no persist interleaves this read.
-    let (active_session_id, session_id, session_file, lanes, turn_in_flight) = {
+    let (active_session_id, session_id, session_file, lanes, turn_in_flight, suspended) = {
         let core = core_lock.lock().unwrap();
         (
             core.active_session_id.clone(),
@@ -269,6 +269,7 @@ pub(crate) fn checkpoint_queue_recovery(
                 .map(|s| s.path.to_string_lossy().to_string()),
             queue_lanes(&core),
             core.busy,
+            core.queued_input_suspended,
         )
     };
     let (busy, operation) = match checkpoint {
@@ -291,6 +292,7 @@ pub(crate) fn checkpoint_queue_recovery(
         operation,
         &lanes.steering,
         &lanes.follow_up,
+        suspended,
     );
 }
 
@@ -305,6 +307,8 @@ pub(crate) fn queue_lanes(core: &SessionCore) -> QueueLanes {
                 queue_key: item.queue_key.clone(),
                 queue_visible: item.queue_visible,
                 policy: item.policy.journal_value().to_string(),
+                forced_batch: item.forced_batch,
+                images: item.images.clone(),
             })
             .collect()
     }
@@ -325,6 +329,10 @@ pub(crate) fn gather_delivery_batch(core: &mut SessionCore, lane: Lane) -> Vec<Q
     let Some(first) = items.front() else {
         return Vec::new();
     };
+    // Only a real pickup starts a new delivery. Empty or parked lanes retain
+    // the prior delivery's cancellation and successful completion facts.
+    core.turn_cancelled = false;
+    core.turn_completed = false;
     // The armed set forces "all" only when the front item is armed; an un-armed
     // front disarms the batch once no armed item remains queued.
     let forced = lane == Lane::Steering && core.forced_all_steering && first.forced_batch;
@@ -365,10 +373,8 @@ pub(crate) fn gather_delivery_batch(core: &mut SessionCore, lane: Lane) -> Vec<Q
 pub(crate) fn restore_queue_snapshot(
     journal: &WorkerRecoveryJournal,
     active_session_id: &str,
-) -> (VecDeque<QueuedItem>, VecDeque<QueuedItem>) {
+) -> (VecDeque<QueuedItem>, VecDeque<QueuedItem>, bool) {
     fn pending(lanes: Vec<crate::journal::WorkerQueueItemRecord>) -> VecDeque<QueuedItem> {
-        // Images on a queued prompt do not survive the restart; the
-        // delivery rows ride the item record without them.
         lanes
             .into_iter()
             .map(|record| {
@@ -399,25 +405,22 @@ pub(crate) fn restore_queue_snapshot(
                     agent_message,
                     queue_key: record.queue_key,
                     admission_id: None,
-                    images: Vec::new(),
+                    images: record.images,
                     done: None,
                     queue_visible: record.queue_visible,
                     policy,
-                    forced_batch: false,
+                    forced_batch: record.forced_batch,
                 }
             })
             .collect()
     }
 
-    let mut steering = VecDeque::new();
-    let mut follow_up = VecDeque::new();
-    if let Some((steering_lanes, follow_up_lanes)) =
-        journal.latest_queue_snapshot(active_session_id)
-    {
-        steering = pending(steering_lanes);
-        follow_up = pending(follow_up_lanes);
+    match journal.latest_queue_snapshot(active_session_id) {
+        Some((steering, follow_up, suspended)) => {
+            (pending(steering), pending(follow_up), suspended)
+        }
+        None => (VecDeque::new(), VecDeque::new(), false),
     }
-    (steering, follow_up)
 }
 
 /// Admit one held autonomous continuation through the follow-up lane:
@@ -521,22 +524,18 @@ pub(crate) fn admit_goal_follow_up(
     work_notify.notify_one();
 }
 
-/// Admit one detached kernel bash completion notice: the row queues on the
-/// steering lane (busy sessions keep a visible steer row, idle sessions wake
-/// into it); a crash before the delivery revives with the row replaying.
-pub(crate) fn admit_bash_completion_notice(
+/// Admit one kernel notice (a detached bash completion or a factory run
+/// milestone): the row queues on the steering lane (busy sessions keep a
+/// visible steer row, idle sessions wake into it); a crash before the
+/// delivery revives with the row replaying.
+pub(crate) fn admit_kernel_notice(
     recovery: &std::sync::Mutex<Option<WorkerRecoveryJournal>>,
     core: &Arc<Mutex<SessionCore>>,
     work_notify: &Arc<Notify>,
-    notice: &crate::engine::BashCompletionNotice,
+    notice: crate::engine::KernelNotice,
     session_is_closed: impl Fn() -> bool,
 ) {
-    let row = pa_core::session_engine::messages::create_async_bash_completion_message(
-        notice.pid,
-        &notice.command,
-        notice.exit_code,
-        crate::util::now_ms(),
-    );
+    let crate::engine::KernelNotice { row, preview_label } = notice;
     let content = match &row.content {
         pa_types::ai::UserContent::Text(text) => text.clone(),
         pa_types::ai::UserContent::Blocks(_) => String::new(),
@@ -558,10 +557,7 @@ pub(crate) fn admit_bash_completion_notice(
         core_guard.steering.push_back(QueuedItem {
             priority: QueuePriority::Background,
             // The queue strip's labeled preview (TS `previewLabel`).
-            preview: Some(format!(
-                "{}: {content}",
-                pa_core::session_engine::messages::ASYNC_BASH_COMPLETION_PREVIEW_LABEL
-            )),
+            preview: Some(format!("{preview_label}: {content}")),
             message: content,
             custom_message: Some(crate::session_commands::custom_message_value(&row)),
             agent_message: None,

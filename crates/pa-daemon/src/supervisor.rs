@@ -57,6 +57,7 @@ pub(crate) use routing::{
 };
 
 // Called only by the supervision sibling module and in-file tests; lib-target unused.
+pub(crate) use worker_lifecycle::RosterFamilySeedOwner;
 #[allow(unused_imports)]
 use worker_lifecycle::{probe_worker_socket, worker_connect_deadline};
 
@@ -345,6 +346,16 @@ impl Supervisor {
                 supervisor.note_catalog_refresh(count);
             });
         }
+        // The first open's family walk reads the spawn ledger: replay it
+        // while that open's worker launches, not on its reply path.
+        {
+            let supervisor = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Ok(ledger) = supervisor.rlm_spawn_ledger_for(None).await {
+                    drop(tokio::task::spawn_blocking(move || ledger.warm()).await);
+                }
+            });
+        }
         socket::prepare_socket_path(&self.options.socket_path).await?;
         let listener = bind_transport(&self.options.socket_path)
             .await
@@ -464,16 +475,6 @@ impl Supervisor {
             tokio::spawn(async move {
                 Supervisor::wait_for_adoption_signal(&mut adopted).await;
                 supervisor.spawn_passive_catalog_warmup();
-            });
-        }
-
-        // Session-archive sweep (roadmap: the sessions directory must not
-        // grow forever): boot sweep, then the periodic re-sweep at the TS
-        // idle-eviction cadence. Housekeeping only — it never gates serving.
-        {
-            let supervisor = Arc::clone(&self);
-            tokio::spawn(async move {
-                crate::session_archive::archive_sweep_loop(&supervisor).await;
             });
         }
 

@@ -30,3 +30,9 @@ Dependency notes (visible because the install is flat):
 - `trace` has no dependencies; everything else may import it.
 
 No credentials are stored here - see `SECURITY.md`. Versions: `VERSIONS.md`, `VERSION`, `CHANGELOG.md`.
+
+## Runtime limits
+
+A daemon session interrupts a `python_repl` cell at `pythonCellTimeoutMs`. The default is 2 hours (`7200000`); `0` disables the limit. Factory runners such as `run_child` and `run_stages` poll a child inside that one cell for the whole staged run, so the previous 60 second default cut the cell off. A per-call `timeout` on the tool cannot ask for longer than the same 2 hour cap. Daemonless sessions do not arm the limit.
+
+`await bash(cmd)` returns only after the command finishes. The result's `exit_code` is the process status (`BashHandle.exit_code` reads the same value). Shell hooks in `factory/engine.py` record that status. The previous daemon behavior returned a still-running snapshot after 1 second and left `exit_code` unset. A handle that is not awaited still runs on, and its `[bash-done]` notice arrives when it finishes.

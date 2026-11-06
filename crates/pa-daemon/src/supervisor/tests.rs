@@ -823,15 +823,191 @@ fn saved_session_rows_publish_deleted_descendant_usage() {
         output_tokens: 110,
         cost: 0.5,
     });
-    let row = saved_session_row(&info);
+    let row = saved_session_row(
+        &info,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(
         row["deletedDescendantUsage"],
         json!({ "inputTokens": 1_100, "outputTokens": 110, "cost": 0.5 })
     );
     // Absent again: the field never rides as a null.
     info.deleted_descendant_usage = None;
-    let row = saved_session_row(&info);
+    let row = saved_session_row(
+        &info,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
     assert!(row.get("deletedDescendantUsage").is_none());
+}
+
+/// A catalog row carries the session's own stored factory specs (its local harness store's factory
+/// entries), read from disk without a kernel; a session without any carries no field.
+#[tokio::test]
+async fn saved_session_rows_count_the_sessions_stored_factory_specs() {
+    let root = std::env::temp_dir().join(format!("pa-saved-fs-{}", uuid::Uuid::new_v4()));
+    let sessions = root.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+    let path = sessions.join(format!("{}.jsonl", session.session_id()));
+    session.set_path(path.clone());
+    session.rewrite().unwrap();
+    let info = crate::session_store::read_session_info(&path).unwrap();
+    let shells = std::collections::HashMap::new();
+    let specs = super::sessions::stored_factory_specs(vec![info.clone()])
+        .await
+        .unwrap();
+    assert!(saved_session_row(&info, &shells, &specs)
+        .get("factorySpecs")
+        .is_none());
+    let harness = pa_core::refinement::get_local_harness_state_dir(
+        crate::scheduled_jobs::session_artifact_dir(&path, &info.id).as_deref(),
+    )
+    .unwrap();
+    crate::test_support::write_factory_specs(&harness, &["a", "b"]);
+    let specs = super::sessions::stored_factory_specs(vec![info.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        saved_session_row(&info, &shells, &specs)["factorySpecs"],
+        json!(2)
+    );
+    #[cfg(unix)]
+    {
+        let state_path = pa_core::refinement::get_harness_state_path(&harness);
+        let specs = crate::test_support::assert_async_file_read(
+            &state_path,
+            super::sessions::stored_factory_specs(vec![info.clone()]),
+        )
+        .await
+        .expect("asynchronous factory spec read");
+        assert_eq!(
+            saved_session_row(&info, &shells, &specs)["factorySpecs"],
+            json!(2)
+        );
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// One catalog listing reads each session's harness store once: the streamed rows and the final
+/// response share that read, so they publish the same rows.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_saved_session_listing_reads_each_sessions_harness_store_once() {
+    let root = std::env::temp_dir().join(format!("pa-saved-once-{}", uuid::Uuid::new_v4()));
+    let sessions = root.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let mut counters = Vec::new();
+    for specs in [&["a"][..], &["a", "b"][..]] {
+        let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+        let path = sessions.join(format!("{}.jsonl", session.session_id()));
+        session.set_path(path.clone());
+        session.rewrite().unwrap();
+        let harness = pa_core::refinement::get_local_harness_state_dir(
+            crate::scheduled_jobs::session_artifact_dir(&path, session.session_id()).as_deref(),
+        )
+        .unwrap();
+        crate::test_support::write_factory_specs(&harness, specs);
+        counters.push(crate::test_support::count_file_reads(
+            &pa_core::refinement::get_harness_state_path(&harness),
+        ));
+    }
+    std::fs::create_dir_all(root.join("agent")).unwrap();
+    std::fs::write(
+        root.join("agent/settings.json"),
+        json!({ "factory": { "enabled": true } }).to_string(),
+    )
+    .unwrap();
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: root.join("daemon.sock"),
+            agent_dir: root.join("agent"),
+        })
+        .expect("supervisor"),
+    );
+    let command = DaemonCommand::ListSavedSessions {
+        id: None,
+        active_session_id: None,
+        cwd: Some("/tmp".to_string()),
+        session_dir: Some(sessions.to_string_lossy().to_string()),
+        scope: Value::Null,
+        limit: None,
+        cursor: None,
+        rest: Map::new(),
+    };
+    let (stream, mut frames) = mpsc::channel(64);
+    let lines = supervisor
+        .handle_saved_session_list(&command, "list", &stream)
+        .await;
+    drop(stream);
+    let reads: Vec<usize> = counters
+        .into_iter()
+        .map(crate::test_support::FileReadCounter::finish)
+        .collect();
+    assert_eq!(reads, [1, 1], "one harness read per session per listing");
+    let mut streamed = Vec::new();
+    while let Some((bundle, _)) = frames.recv().await {
+        for frame in bundle {
+            if let Outbound::Line(line) = frame {
+                if line["type"] == "session_list_item" {
+                    streamed.push(line["session"].clone());
+                }
+            }
+        }
+    }
+    let sessions_served = lines[0]["data"]["sessions"].as_array().unwrap();
+    assert_eq!(&streamed, sessions_served);
+    let mut specs: Vec<u64> = streamed
+        .iter()
+        .map(|row| row["factorySpecs"].as_u64().unwrap())
+        .collect();
+    specs.sort_unstable();
+    assert_eq!(specs, [1, 2]);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// While the factory stays off (the opt-in gate), the catalog reads no stored factory specs: a
+/// session holding specs carries no `factorySpecs`.
+#[tokio::test]
+async fn a_saved_session_listing_skips_stored_factory_specs_while_the_factory_is_off() {
+    let root = std::env::temp_dir().join(format!("pa-saved-off-{}", uuid::Uuid::new_v4()));
+    let sessions = root.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let mut session = crate::session_store::SessionFile::create("/tmp", None, 0);
+    let path = sessions.join(format!("{}.jsonl", session.session_id()));
+    session.set_path(path.clone());
+    session.rewrite().unwrap();
+    let harness = pa_core::refinement::get_local_harness_state_dir(
+        crate::scheduled_jobs::session_artifact_dir(&path, session.session_id()).as_deref(),
+    )
+    .unwrap();
+    crate::test_support::write_factory_specs(&harness, &["a"]);
+    let supervisor = Arc::new(
+        Supervisor::new(SupervisorOptions {
+            socket_path: root.join("daemon.sock"),
+            agent_dir: root.join("agent"),
+        })
+        .expect("supervisor"),
+    );
+    let command = DaemonCommand::ListSavedSessions {
+        id: None,
+        active_session_id: None,
+        cwd: Some("/tmp".to_string()),
+        session_dir: Some(sessions.to_string_lossy().to_string()),
+        scope: Value::Null,
+        limit: None,
+        cursor: None,
+        rest: Map::new(),
+    };
+    let (stream, _frames) = mpsc::channel(64);
+    let lines = supervisor
+        .handle_saved_session_list(&command, "list", &stream)
+        .await;
+    let rows = lines[0]["data"]["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].get("factorySpecs").is_none(), "{rows:?}");
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]
@@ -850,7 +1026,11 @@ fn saved_session_rows_carry_the_persisted_thinking_level() {
     let summary = saved_session_summary(&info);
     assert_eq!(summary["thinkingLevel"], json!("high"));
     assert!(summary["model"].is_null(), "saved rows carry no model");
-    let row = saved_session_row(&info);
+    let row = saved_session_row(
+        &info,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(row["thinkingLevel"], json!("high"));
     assert_eq!(row["model"], json!({ "provider": "p", "modelId": "m" }));
     // A session file without a persisted level stays bare (a fresh
@@ -864,9 +1044,13 @@ fn saved_session_rows_carry_the_persisted_thinking_level() {
     assert!(saved_session_summary(&draft_info)
         .get("thinkingLevel")
         .is_none());
-    assert!(saved_session_row(&draft_info)
-        .get("thinkingLevel")
-        .is_none());
+    assert!(saved_session_row(
+        &draft_info,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new()
+    )
+    .get("thinkingLevel")
+    .is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -889,7 +1073,11 @@ fn saved_session_rows_publish_the_own_usage_summary() {
     }));
     session.rewrite().unwrap();
     let info = crate::session_store::read_session_info(&path).unwrap();
-    let row = saved_session_row(&info);
+    let row = saved_session_row(
+        &info,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+    );
     assert_eq!(
         row["usage"],
         json!({ "inputTokens": 105, "outputTokens": 10, "cost": 0.25 })
@@ -905,8 +1093,78 @@ fn saved_session_rows_publish_the_own_usage_summary() {
     draft.set_path(draft_path.clone());
     draft.rewrite().unwrap();
     let draft_info = crate::session_store::read_session_info(&draft_path).unwrap();
-    assert!(saved_session_row(&draft_info).get("usage").is_none());
+    assert!(saved_session_row(
+        &draft_info,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new()
+    )
+    .get("usage")
+    .is_none());
     assert!(saved_session_summary(&draft_info).get("usage").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The whole catalog row on one fixture that exercises every optional key
+/// (name, state, model, thinking level, parent binding, usage): one literal
+/// comparison, so any wire change — a key added, renamed, or dropped — fails
+/// here first, before any client depends on the new shape.
+#[test]
+fn saved_session_rows_match_the_catalog_row_golden() {
+    let dir = std::env::temp_dir().join(format!("pa-saved-golden-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut session =
+        crate::session_store::SessionFile::create("/repo", Some("/s/parent.jsonl"), 1);
+    // The row's id and created timestamp read from the session header: pin
+    // both, so the golden stays one literal.
+    session.header.id = "golden-session".to_string();
+    session.header.timestamp = "2026-09-21T00:00:00.000Z".to_string();
+    let path = dir.join("golden-session.jsonl");
+    session.set_path(path.clone());
+    session.append_session_info("golden name");
+    // An assistant message with provider/model later overrides the change,
+    // pinning the fold's last-write-wins row.
+    session.append_model_change("prime", "superb");
+    session.append_thinking_level_change("high");
+    session.append_session_state("active");
+    session.append_message(&json!({
+        "role": "user", "content": "fix the login bug", "timestamp": 1_790_000_000_000_u64
+    }));
+    session.append_message(&json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "fixed in auth.rs" }],
+        "provider": "p", "model": "m", "timestamp": 1_790_000_060_000_u64,
+        "usage": {
+            "input": 100, "output": 10, "cacheRead": 5, "cacheWrite": 0,
+            "totalTokens": 115,
+            "cost": { "input": 0.0, "output": 0.25, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.25 }
+        }
+    }));
+    session.rewrite().unwrap();
+
+    let info = crate::session_store::read_session_info(&path).unwrap();
+    assert_eq!(
+        saved_session_row(
+            &info,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new()
+        ),
+        json!({
+            "path": path.to_string_lossy(),
+            "id": "golden-session",
+            "cwd": "/repo",
+            "rlmDepth": 1,
+            "created": "2026-09-21T00:00:00.000Z",
+            "modified": "2026-09-21T14:14:20.000Z",
+            "messageCount": 2,
+            "firstMessage": "fix the login bug",
+            "state": { "status": "active" },
+            "name": "golden name",
+            "parentSessionPath": "/s/parent.jsonl",
+            "model": { "provider": "p", "modelId": "m" },
+            "usage": { "inputTokens": 105, "outputTokens": 10, "cost": 0.25 },
+            "thinkingLevel": "high"
+        })
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1005,6 +1263,7 @@ async fn adoption_settles_then_seeds_the_roster_once() {
             child: child_file.to_string_lossy().to_string(),
             depth: 1,
             name: "lane".to_string(),
+            factory: None,
         })
         .unwrap();
     let descriptor = pa_types::daemon::DaemonWorkerDescriptor {
@@ -1095,7 +1354,7 @@ async fn a_create_while_shutting_down_is_refused() {
         rest: Map::default(),
     };
     let refused = supervisor
-        .launch_worker(&create, None)
+        .launch_worker(&create, None, RosterFamilySeedOwner::Registration)
         .await
         .err()
         .expect("the shutting-down supervisor accepted a create");
@@ -1361,7 +1620,7 @@ async fn first_signal_drains_a_settling_turn_and_rejects_new_work() {
         "the first signal must start the drain"
     );
     let refused = supervisor
-        .launch_worker(&create, None)
+        .launch_worker(&create, None, RosterFamilySeedOwner::Registration)
         .await
         .err()
         .expect("a create during the drain must be rejected");
@@ -1911,6 +2170,7 @@ async fn a_ledger_delete_of_a_stopped_child_tombstones_without_a_worker() {
             child: child_file.to_string_lossy().into_owned(),
             depth: 1,
             name: "parked-worker".to_string(),
+            factory: None,
         })
         .expect("the spawn edge appends");
     assert_eq!(ledger.live_edges().expect("edges").len(), 1);
@@ -2074,6 +2334,7 @@ async fn the_stopped_childs_delete_removes_its_row_and_bills_the_parent() {
             child: child_transcript.to_string_lossy().into_owned(),
             depth: 1,
             name: "parked-worker".to_string(),
+            factory: None,
         })
         .expect("the spawn edge appends");
     let mut events = supervisor.events.subscribe();
@@ -2185,6 +2446,7 @@ async fn a_ledger_delete_never_tombstones_an_unrelated_edge_sharing_the_child_id
                 child: child.clone(),
                 depth: 1,
                 name: stem.to_string(),
+                factory: None,
             })
             .expect("the spawn edge appends");
     }
@@ -2254,6 +2516,7 @@ async fn a_ledger_child_wake_joins_an_already_hosting_resident() {
             child: session_file.to_string_lossy().into_owned(),
             depth: 1,
             name: "kid-1".to_string(),
+            factory: None,
         })
         .expect("the spawn edge appends");
     // The concurrent revival's resident already hosting the child's file.
@@ -2478,4 +2741,49 @@ proptest! {
             Ok(())
         })?;
     }
+}
+
+#[tokio::test]
+async fn a_restarted_supervisors_registration_seeds_the_roster_family() {
+    let (dir, supervisor, root_file, child_file) =
+        crate::supervisor_roster_seed::tests::roster_fixture().await;
+    let agent_dir = dir.join("agent");
+    crate::supervisor_roster_seed::tests::append_family_edge(
+        &agent_dir,
+        &agent_dir.join("sessions"),
+        "sub-9",
+        &root_file,
+        &child_file,
+    );
+    crate::supervisor_roster_seed::tests::register_root_worker(&supervisor, "w-root", &root_file)
+        .await;
+    let command = DaemonCommand::WorkerRegister {
+        id: None,
+        active_session_id: "w-root".to_string(),
+        session_id: None,
+        socket_path: "/tmp/none.sock".to_string(),
+        worker_instance_id: String::new(),
+        token: "w-root-token".to_string(),
+        pid: 4242,
+        rest: Map::default(),
+    };
+    let registered = supervisor
+        .handle_worker_register("r1", "worker_register", &command)
+        .await;
+    assert!(registered.success, "registration refused: {registered:?}");
+    assert_eq!(
+        registered.data.expect("registration response")["epoch"],
+        1,
+        "the re-registration is the first under the restarted supervisor"
+    );
+    crate::supervisor_roster_seed::tests::drain_pending_seeds_for_tests(&supervisor).await;
+    let row = crate::supervisor_roster_seed::tests::roster_row_for_child(&supervisor, "sub-9");
+    assert_eq!(row.summary["rlmChildId"], "sub-9");
+    assert_eq!(
+        row.summary["parentSessionPath"],
+        root_file.to_string_lossy().to_string()
+    );
+    assert_eq!(row.summary["runtimeKind"], "subagent");
+    assert_eq!(row.worker_id, None, "the seeded row, never a worker's");
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -29,6 +29,8 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
         created: false,
         attached_client_ids: Vec::new(),
         abort_requested: false,
+        turn_cancelled: false,
+        turn_completed: false,
         suppress_aborted_row: false,
         shutdown_requested: false,
         compacting: false,
@@ -53,6 +55,7 @@ fn burst_runner(engine: Arc<dyn SessionEngine>) -> TurnRunner {
         active_action: None,
         running_tool_calls: std::collections::HashSet::new(),
         running_admission_ids: std::collections::HashSet::new(),
+        tool_use_count: 0,
     }));
     TurnRunner {
         core,
@@ -83,6 +86,7 @@ async fn turn_session_events(engine: Arc<dyn SessionEngine>) -> Vec<Value> {
     runner
         .run_turn(
             engine,
+            Lane::Steering,
             vec![QueuedItem {
                 priority: QueuePriority::Human,
                 preview: None,
@@ -122,14 +126,21 @@ fn positions_of(events: &[Value], frame_type: &str) -> Vec<usize> {
 // The abort gate's arm semantics, pinned on the wire: `run_turn` driven
 // directly (the pickup's delivery-scoped clear never ran), so the final-emit
 // race is deterministic.
+#[derive(Default)]
 struct GateProbeEngine {
     frames: Vec<EngineEvent>,
     boundaries: Mutex<Vec<Option<String>>>,
+    turns_done: std::sync::atomic::AtomicUsize,
 }
 
 impl SessionEngine for GateProbeEngine {
     fn set_prompt_context_boundary(&self, leaf_id: Option<String>) {
         self.boundaries.lock().unwrap().push(leaf_id);
+    }
+
+    fn on_turn_done(&self) {
+        self.turns_done
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn run_prompt(
@@ -196,7 +207,7 @@ async fn gate_sighting_events(
 ) -> Vec<Value> {
     let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
         frames,
-        boundaries: Mutex::new(Vec::new()),
+        ..GateProbeEngine::default()
     });
     let runner = burst_runner(Arc::clone(&engine));
     {
@@ -208,6 +219,7 @@ async fn gate_sighting_events(
     runner
         .run_turn(
             engine,
+            Lane::Steering,
             vec![QueuedItem {
                 priority: QueuePriority::Human,
                 preview: None,
@@ -262,6 +274,120 @@ async fn done_aborted_arms_the_fallback_silence() {
     assert!(
         positions_of(&events, "agent_end").is_empty(),
         "the aborted settle keeps the suppressed-run silence: {events:?}"
+    );
+}
+
+/// A turn aborted under row suppression (a manual compaction or tree move)
+/// still reaches the engine's turn boundary at its swallowed `Done`, so
+/// child prompts held for that turn are released.
+#[tokio::test]
+async fn a_suppressed_abort_still_ends_the_engine_turn() {
+    for done in [EngineEvent::Done(Ok(())), EngineEvent::DoneAborted] {
+        let engine = Arc::new(GateProbeEngine {
+            frames: vec![done],
+            ..GateProbeEngine::default()
+        });
+        let dynamic: Arc<dyn SessionEngine> = engine.clone();
+        let runner = burst_runner(Arc::clone(&dynamic));
+        {
+            let mut core = runner.core.lock().unwrap();
+            core.abort_requested = true;
+            core.suppress_aborted_row = true;
+        }
+        runner
+            .run_turn(
+                dynamic,
+                Lane::Steering,
+                vec![QueuedItem {
+                    priority: QueuePriority::Human,
+                    preview: None,
+                    message: "aborted".to_string(),
+                    custom_message: None,
+                    agent_message: None,
+                    queue_key: None,
+                    admission_id: None,
+                    images: Vec::new(),
+                    done: None,
+                    queue_visible: true,
+                    policy: TurnPolicy::Queued,
+                    forced_batch: false,
+                }],
+            )
+            .await;
+        assert_eq!(
+            engine.turns_done.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+}
+
+/// #4: the turn's tool executions count onto the session's `toolUseCount`
+/// (TS bumps the child's counter per `tool_execution_start`), the value the
+/// worker's roster deltas carry.
+#[tokio::test]
+async fn a_turns_tool_executions_count_onto_the_summary() {
+    let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
+        frames: vec![
+            EngineEvent::ToolExecutionStart {
+                tool_call_id: "t1".to_string(),
+                tool_name: "bash".to_string(),
+                args: Value::Null,
+            },
+            EngineEvent::ToolExecutionEnd {
+                tool_call_id: "t1".to_string(),
+                result: Value::Null,
+                is_error: false,
+            },
+            EngineEvent::ToolExecutionStart {
+                tool_call_id: "t2".to_string(),
+                tool_name: "edit".to_string(),
+                args: Value::Null,
+            },
+            EngineEvent::Done(Ok(())),
+        ],
+        ..GateProbeEngine::default()
+    });
+    let runner = burst_runner(Arc::clone(&engine));
+    runner
+        .run_turn(
+            engine,
+            Lane::Steering,
+            vec![QueuedItem {
+                priority: QueuePriority::Human,
+                preview: None,
+                message: "tools".to_string(),
+                custom_message: None,
+                agent_message: None,
+                queue_key: None,
+                admission_id: None,
+                images: Vec::new(),
+                done: None,
+                queue_visible: true,
+                policy: TurnPolicy::Queued,
+                forced_batch: false,
+            }],
+        )
+        .await;
+    let summary = {
+        let core = runner.core.lock().unwrap();
+        session_summary(
+            &core,
+            SummaryInputs {
+                thinking_level: "default".to_string(),
+                model: None,
+                model_fallback_message: None,
+                bash_running: false,
+                quota_parked: false,
+                subagents_running: false,
+                progress_note: None,
+            },
+        )
+    };
+    let summary = serde_json::to_value(&summary).unwrap();
+    assert_eq!(
+        summary["toolUseCount"],
+        json!(2),
+        "the summary: {summary:?}"
     );
 }
 
@@ -327,7 +453,7 @@ async fn model_transitions_reach_the_worker_owned_session_file() {
         }
         let engine: Arc<dyn SessionEngine> = Arc::new(GateProbeEngine {
             frames,
-            boundaries: Mutex::new(Vec::new()),
+            ..GateProbeEngine::default()
         });
         let runner = burst_runner(Arc::clone(&engine));
         let mut store = crate::session_store::SessionFile::create("/fixture", None, 0);
@@ -342,6 +468,7 @@ async fn model_transitions_reach_the_worker_owned_session_file() {
         runner
             .run_turn(
                 engine,
+                Lane::Steering,
                 vec![QueuedItem {
                     priority: QueuePriority::Human,
                     preview: None,
@@ -397,7 +524,7 @@ async fn prompt_restore_boundary_is_supplied_only_for_file_backed_stores() {
     for file_backed in [false, true] {
         let engine = Arc::new(GateProbeEngine {
             frames: vec![EngineEvent::Done(Ok(()))],
-            boundaries: Mutex::new(Vec::new()),
+            ..GateProbeEngine::default()
         });
         let dynamic: Arc<dyn SessionEngine> = engine.clone();
         let runner = burst_runner(Arc::clone(&dynamic));
@@ -419,6 +546,7 @@ async fn prompt_restore_boundary_is_supplied_only_for_file_backed_stores() {
         runner
             .run_turn(
                 dynamic,
+                Lane::Steering,
                 vec![QueuedItem {
                     priority: QueuePriority::Human,
                     preview: None,

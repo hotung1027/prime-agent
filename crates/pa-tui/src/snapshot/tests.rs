@@ -34,6 +34,7 @@ fn rendered_card_text(view: &crate::view::AgentView) -> Vec<String> {
         card,
         0,
         crate::chat::Detail::Overview,
+        crate::chat::Detail::Overview,
         &view.theme,
         100,
         true,
@@ -101,39 +102,6 @@ fn empty_user_message_renders_no_entry() {
     let message = json!({ "role": "user", "content": [] });
     assert_eq!(user_display_text(&message), None);
     assert!(message_value_to_entries(&message).is_empty());
-}
-
-#[test]
-fn transcript_presents_the_summary_after_the_retained_tail() {
-    let messages = vec![
-        json!({
-            "role": "compactionSummary", "summary": "the story",
-            "retainedMessageCount": 2, "tokensBefore": 12, "timestamp": 30u64
-        }),
-        json!({"role": "user", "content": "second turn", "timestamp": 20u64}),
-        json!({"role": "assistant", "content": "kept intact", "timestamp": 25u64}),
-        json!({
-            "role": "custom", "customType": "session_slash_command",
-            "content": "/compact focus on the goal", "display": true, "timestamp": 40u64,
-            "details": { "command": {
-                "name": "compact",
-                "args": "focus on the goal",
-                "text": "/compact focus on the goal"
-            } }
-        }),
-    ];
-    let entries = transcript_to_entries(&messages);
-    let order: Vec<String> = entries
-        .iter()
-        .filter_map(|entry| match entry {
-            ChatEntry::User { .. } => Some("user".to_string()),
-            ChatEntry::Assistant { .. } => Some("assistant".to_string()),
-            ChatEntry::CompactionSummary { .. } => Some("summary".to_string()),
-            ChatEntry::SlashCommand { .. } => Some("slash".to_string()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(order, ["user", "assistant", "summary", "slash"]);
 }
 
 #[test]
@@ -2143,6 +2111,7 @@ fn elided_image_tool_results_render_their_marker_metadata() {
         card,
         0,
         crate::chat::Detail::All,
+        crate::chat::Detail::All,
         &crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor),
         100,
         true,
@@ -2174,7 +2143,7 @@ fn a_windowed_snapshot_reconstructs_the_full_history_scalars() {
         { "role": "assistant", "content": [{ "type": "text", "text": "old answer" }], "timestamp": 110u64 },
         { "role": "assistant", "content": [{ "type": "text", "text": "settled answer" }], "timestamp": 120u64 },
     ]);
-    windowed["snapshot"]["historyBefore"] = json!(1u64);
+    windowed["snapshot"]["historyBeforeEntryId"] = json!("e1");
     windowed["snapshot"]["lastUserPromptMs"] = json!(100u64);
 
     let full_prompt_ms = reconstruct(&attach_data_from_response(full).unwrap()).last_user_prompt_ms;
@@ -2227,7 +2196,7 @@ fn backfilled_entries_match_the_full_decode_across_the_seam() {
     joined_matches_full(&[user("one"), answer("a"), user("two"), answer("b")], 2);
     joined_matches_full(&[user("one"), tool_call, tool_result, answer("done")], 1);
     joined_matches_full(
-        &[summary, user("kept one"), user("kept two"), answer("after")],
+        &[user("kept one"), user("kept two"), summary, answer("after")],
         3,
     );
 }
@@ -2311,7 +2280,7 @@ fn windowed_prompt_time_prefers_the_readable_tail_over_an_older_scalar() {
         json!("1970-01-01T01:00:02.000+01:00"),
     ] {
         let mut data = slim_attach();
-        data["snapshot"]["historyBefore"] = json!(1);
+        data["snapshot"]["historyBeforeEntryId"] = json!("e1");
         data["snapshot"]["lastUserPromptMs"] = json!(1000);
         data["snapshot"]["messages"] = json!([
             { "role": "user", "content": "latest", "timestamp": timestamp }
@@ -2320,7 +2289,7 @@ fn windowed_prompt_time_prefers_the_readable_tail_over_an_older_scalar() {
         full["snapshot"]
             .as_object_mut()
             .unwrap()
-            .remove("historyBefore");
+            .remove("historyBeforeEntryId");
         full["snapshot"]
             .as_object_mut()
             .unwrap()

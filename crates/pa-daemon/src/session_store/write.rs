@@ -294,12 +294,16 @@ impl SessionFile {
                 Ok(())
             });
             if let Err(error) = rewritten {
-                self.by_id.remove(&id);
-                self.entries.pop();
-                self.leaf_id = previous_leaf;
+                self.unindex_last();
+                self.set_leaf(previous_leaf);
                 return Err(error);
             }
             self.fold_attribution_id(&id);
+        }
+        if let (Some(sink), Some(entry)) = (&self.billed_row_sink.0, self.entry(&id)) {
+            if let Some(row) = crate::session_usage::billed_store_row(entry) {
+                sink(&row);
+            }
         }
         Ok(id)
     }

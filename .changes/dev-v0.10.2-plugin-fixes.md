@@ -1,0 +1,2 @@
+- `python_repl` cells in a daemon session now run for up to 2 hours before they are interrupted (`pythonCellTimeoutMs`, default `7200000`; `0` disables; a per-call `timeout` cannot exceed the same 2 hours). The previous 60 second default cut off factory plugin cells that poll a child inside one cell.
+- `await bash()` returns only after the command finishes, with an integer `exit_code`. It no longer returns a still-running snapshot after 1 second.

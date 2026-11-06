@@ -40,6 +40,7 @@ fn review_markdown_escaped_delimiters_keep_their_emphasis() {
 
 #[test]
 fn review_markdown_destinations_balance_before_a_title() {
+    crate::hyperlinks::set_hyperlinks_override(Some(false));
     let style = MarkdownStyle::default();
     // The pinned real TS frame accepts this destination before a quoted title.
     let permissive = "[t](foo(bar \"title\")";
@@ -67,13 +68,14 @@ fn review_markdown_destinations_balance_before_a_title() {
             assert_eq!(ranges[0].url, "foo(bar)");
             // Visible text excludes zero-width metadata under either capability.
             crate::hyperlinks::strip_osc8(&mut spans);
-            assert_eq!(
-                spans,
-                vec![
-                    Span::styled("t", style.body.add_modifier(Modifier::UNDERLINED)),
-                    Span::styled(" (foo(bar))", style.link_url)
-                ]
-            );
+            let mut expected = vec![Span::styled(
+                "t",
+                style.body.add_modifier(Modifier::UNDERLINED),
+            )];
+            if !capability {
+                expected.push(Span::styled(" (foo(bar))", style.link_url));
+            }
+            assert_eq!(spans, expected);
         }
     }
     crate::hyperlinks::set_hyperlinks_override(None);
@@ -247,6 +249,7 @@ fn review_markdown_adjacent_emphasis_keeps_the_next_opener() {
 
 #[test]
 fn review_markdown_link_titles_skip_escaped_quotes() {
+    crate::hyperlinks::set_hyperlinks_override(Some(false));
     let style = MarkdownStyle::default();
     for text in [r#"[t](url "a \"b\"")"#, r"[t](url 'a \'b\'')"] {
         let mut spans = render_inline(text, &style);
@@ -257,6 +260,7 @@ fn review_markdown_link_titles_skip_escaped_quotes() {
         );
         assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
     }
+    crate::hyperlinks::set_hyperlinks_override(None);
 }
 
 #[test]
@@ -535,7 +539,7 @@ fn heading_and_paragraph() {
 
 #[test]
 fn heading_link_wraps_keeps_the_affordance_and_counts() {
-    crate::hyperlinks::set_hyperlinks_override(Some(true));
+    crate::hyperlinks::set_hyperlinks_override(Some(false));
     let style = MarkdownStyle::default();
     let lines = render_markdown("# [docs](https://x.dev/a)", 40, &style);
     assert_eq!(lines.len(), 1);
@@ -551,7 +555,7 @@ fn heading_link_wraps_keeps_the_affordance_and_counts() {
     assert_eq!(visible, "docs (https://x.dev/a)");
     // A narrow heading wraps like any row: the bracket — closing `]` included —
     // lands on its own row instead of clipping (count==paint at every width).
-    let rows = render_markdown("# [docs](https://x.dev/a)", 20, &style);
+    let rows = super::render_markdown("# [docs](https://x.dev/a)", 20, &style);
     assert_eq!(rows.len(), 2, "rows: {rows:?}");
     let visible: Vec<String> = rows
         .iter()
@@ -853,6 +857,45 @@ fn inline_bold_code_link() {
 }
 
 #[test]
+fn hyperlink_terminals_show_the_link_label_without_the_url_bracket() {
+    // With OSC 8 support the clickable label stands alone on both link paths:
+    // no `(url)` bracket and no bracket slot.
+    crate::hyperlinks::set_hyperlinks_override(Some(true));
+    let style = MarkdownStyle::default();
+    for (text, label, href) in [
+        ("[docs](https://x.dev/a)", "docs", "https://x.dev/a"),
+        ("www.x.dev/a", "www.x.dev/a", "http://www.x.dev/a"),
+    ] {
+        let (spans, url_slots, _) = super::inline::render_inline_tracked(text, &style);
+        assert_eq!(
+            spans.iter().map(|s| s.content.as_str()).collect::<String>(),
+            format!(
+                "{}{label}{}",
+                crate::hyperlinks::osc8_open(href),
+                crate::hyperlinks::OSC8_CLOSE
+            )
+        );
+        assert!(url_slots.is_empty(), "{text}");
+    }
+    crate::hyperlinks::set_hyperlinks_override(None);
+}
+
+#[test]
+fn terminals_without_hyperlinks_keep_the_url_bracket() {
+    crate::hyperlinks::set_hyperlinks_override(Some(false));
+    let style = MarkdownStyle::default();
+    for (text, href) in [
+        ("[docs](https://x.dev/a)", "https://x.dev/a"),
+        ("www.x.dev/a", "http://www.x.dev/a"),
+    ] {
+        let (spans, url_slots, _) = super::inline::render_inline_tracked(text, &style);
+        assert_eq!(url_slots, vec![1], "{text}");
+        assert_eq!(spans[1], Span::styled(format!(" ({href})"), style.link_url));
+    }
+    crate::hyperlinks::set_hyperlinks_override(None);
+}
+
+#[test]
 fn legacy_link_row_is_underlined_and_shows_the_url() {
     crate::hyperlinks::set_hyperlinks_override(Some(false));
     let style = MarkdownStyle::default();
@@ -881,7 +924,7 @@ fn legacy_link_row_is_underlined_and_shows_the_url() {
 }
 
 #[test]
-fn osc8_gated_link_row_wraps_the_label_in_a_hyperlink_and_shows_the_url() {
+fn osc8_gated_link_row_wraps_the_label_in_a_hyperlink_and_hides_the_url() {
     crate::hyperlinks::set_hyperlinks_override(Some(true));
     let style = MarkdownStyle::default();
     let spans = render_inline("see [docs](https://x.dev/a)", &style);
@@ -889,7 +932,7 @@ fn osc8_gated_link_row_wraps_the_label_in_a_hyperlink_and_shows_the_url() {
     assert_eq!(
         joined,
         format!(
-            "see {}docs{} (https://x.dev/a)",
+            "see {}docs{}",
             crate::hyperlinks::osc8_open("https://x.dev/a"),
             crate::hyperlinks::OSC8_CLOSE
         )
@@ -898,10 +941,8 @@ fn osc8_gated_link_row_wraps_the_label_in_a_hyperlink_and_shows_the_url() {
         spans[1].style.add_modifier.contains(Modifier::UNDERLINED),
         "the label underlines: {joined}"
     );
-    assert_eq!(spans[2].style.fg, style.link_url.fg);
-    // The sequences are zero-width: the row measures like plain text plus the
-    // bracketed URL.
-    assert_eq!(str_width(&joined), str_width("see docs (https://x.dev/a)"));
+    // The sequences are zero-width: the row measures like plain text.
+    assert_eq!(str_width(&joined), str_width("see docs"));
     // Windows drive-letter targets classify as file paths; the label is
     // the URL, so no bracket follows it.
     let drive = render_inline("[c:\\src](c:\\src)", &style);
@@ -934,17 +975,14 @@ fn balanced_parens_in_a_link_destination_stay_intact() {
     let spans = render_inline(&format!("[math]({url})"), &style);
     assert_eq!(
         spans,
-        vec![
-            Span::styled(
-                format!(
-                    "{}math{}",
-                    crate::hyperlinks::osc8_open(url),
-                    crate::hyperlinks::OSC8_CLOSE
-                ),
-                style.body.add_modifier(Modifier::UNDERLINED),
+        vec![Span::styled(
+            format!(
+                "{}math{}",
+                crate::hyperlinks::osc8_open(url),
+                crate::hyperlinks::OSC8_CLOSE
             ),
-            Span::styled(format!(" ({url})"), style.link_url),
-        ]
+            style.body.add_modifier(Modifier::UNDERLINED),
+        ),]
     );
     crate::hyperlinks::set_hyperlinks_override(None);
 }
@@ -998,7 +1036,7 @@ fn the_url_bracket_scrubs_terminal_control_bytes() {
     // A raw escape byte smuggled into the url must never re-enter the terminal as a
     // live OSC/CSI sequence: the bracket percent-encodes control bytes like the OSC 8
     // target.
-    crate::hyperlinks::set_hyperlinks_override(Some(true));
+    crate::hyperlinks::set_hyperlinks_override(Some(false));
     let style = MarkdownStyle::default();
     let url = "https://x.dev/\u{1b}]52;c;base64";
     let spans = render_inline(&format!("[a]({url})"), &style);
@@ -1018,7 +1056,7 @@ fn the_url_bracket_scrubs_terminal_control_bytes() {
 
 #[test]
 fn link_url_bracket_wraps_and_counts_like_text() {
-    crate::hyperlinks::set_hyperlinks_override(Some(true));
+    crate::hyperlinks::set_hyperlinks_override(Some(false));
     let style = MarkdownStyle::default();
     let text = "see [docs](https://x.dev/a) tail";
     // The bracketed URL is visible text: the width accounting includes it, so the
@@ -1053,10 +1091,10 @@ fn link_url_bracket_wraps_and_counts_like_text() {
 
 #[test]
 fn long_link_url_wraps_without_breaking_the_clickable_region() {
-    crate::hyperlinks::set_hyperlinks_override(Some(true));
+    crate::hyperlinks::set_hyperlinks_override(Some(false));
     let style = MarkdownStyle::default();
     let url = format!("https://x.dev/{}", "a".repeat(40));
-    let rows = render_markdown(&format!("[docs]({url})"), 12, &style);
+    let rows = super::render_markdown(&format!("[docs]({url})"), 12, &style);
     assert!(rows.len() >= 4, "rows: {rows:?}");
     for row in &rows {
         let joined: String = row.iter().map(|s| s.content.as_str()).collect();
@@ -1172,9 +1210,10 @@ fn bare_url_autolink_forms() {
 }
 
 #[test]
-fn www_autolink_gains_scheme_and_shows_the_url_in_both_forms() {
-    // A www autolink's href gains the scheme, so the target differs
-    // from the label and the bracket shows in BOTH capability forms.
+fn www_autolink_gains_scheme_and_shows_the_url_without_hyperlinks() {
+    // A www autolink's href gains the scheme, so the target differs from the
+    // label: the fallback form shows the bracket, the OSC 8 form links the
+    // scheme-qualified target.
     let style = MarkdownStyle::default();
     crate::hyperlinks::set_hyperlinks_override(Some(false));
     let spans = render_inline("www.example.com/path", &style);
@@ -1195,7 +1234,7 @@ fn www_autolink_gains_scheme_and_shows_the_url_in_both_forms() {
     assert_eq!(
         joined,
         format!(
-            "{}www.example.com/path{} (http://www.example.com/path)",
+            "{}www.example.com/path{}",
             crate::hyperlinks::osc8_open("http://www.example.com/path"),
             crate::hyperlinks::OSC8_CLOSE
         )
@@ -1204,7 +1243,6 @@ fn www_autolink_gains_scheme_and_shows_the_url_in_both_forms() {
         spans[0].style.add_modifier.contains(Modifier::UNDERLINED),
         "the OSC 8 autolink label underlines"
     );
-    assert_eq!(spans[1].style.fg, style.link_url.fg);
     crate::hyperlinks::set_hyperlinks_override(None);
 }
 
@@ -1891,4 +1929,72 @@ fn an_escaped_bang_before_a_link_is_not_an_image() {
     let spans = render_inline(r"\\![alt](https://x.dev/c)", &style);
     let joined: String = spans.iter().map(|s| s.content.as_str()).collect();
     assert_eq!(joined, "\\alt");
+}
+
+/// Text carrying escape sequences and control characters (a model or a tool can emit any of
+/// them) paints only its visible characters, in exactly as many cells as `str_width` measures.
+#[test]
+fn painted_cells_hold_no_control_characters_and_match_the_measured_width() {
+    let text = "a\x07b\x08c\x1b[31md\x0be\u{9b}f\x1b[2Jg\x1bch\x1b[?1049li\x1b]0;title\x07j\x1bPq\x1b\\k\x7fl\u{85}m\tn";
+    let line: Line = vec![Span::raw(text)];
+    let area = ratatui::layout::Rect::new(0, 0, 30, 1);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(to_ratatui_line(&line), area, &mut buffer);
+    let cells: Vec<&str> = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+    assert!(
+        cells.iter().all(|cell| !cell.chars().any(char::is_control)),
+        "{cells:?}"
+    );
+    assert_eq!(cells.concat().trim_end(), "abcdefgchijklm   n");
+    assert_eq!(str_width(text), "abcdefgchijklm   n".len());
+}
+
+/// Screen-clearing and screen-switching sequences inside message text never reach the terminal:
+/// the painted bytes hold only the paint's own cursor moves, colors and cursor visibility.
+#[test]
+fn screen_clearing_sequences_in_message_text_never_reach_the_terminal() {
+    #[derive(Clone, Default)]
+    struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let text = "keep\x1b[2Jone\x1b[3Jtwo\x1bcthree\x1b[?1049lfour";
+    let sink = Sink::default();
+    let area = ratatui::layout::Rect::new(0, 0, 40, 1);
+    let mut terminal = ratatui::Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(sink.clone()),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(area),
+        },
+    )
+    .unwrap();
+    terminal
+        .draw(|frame| frame.render_widget(to_ratatui_line(&vec![Span::raw(text)]), area))
+        .unwrap();
+    let bytes = String::from_utf8(sink.0.borrow().clone()).unwrap();
+    let mut visible = String::new();
+    let mut rest = bytes.as_str();
+    while let Some(c) = rest.chars().next() {
+        if let Some(len) = crate::width::escape_len(rest) {
+            let sequence = &rest[..len];
+            assert!(
+                sequence.ends_with('H')
+                    || sequence.ends_with('m')
+                    || matches!(sequence, "\x1b[?25l" | "\x1b[?25h"),
+                "{sequence:?} reached the terminal"
+            );
+            rest = &rest[len..];
+            continue;
+        }
+        assert!(!c.is_control(), "{c:?} reached the terminal");
+        visible.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    assert_eq!(visible.trim_end(), "keeponetwocthreefour");
 }

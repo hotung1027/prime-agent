@@ -26,9 +26,6 @@ pub struct SessionInfo {
     pub modified: String,
     pub message_count: usize,
     pub first_message: String,
-    /// Every user/assistant message text, concatenated, capped at
-    /// `SESSION_LIST_SEARCH_TEXT_MAX_CHARS`: the agents-view search corpus.
-    pub all_messages_text: String,
     /// The own-usage summary — assistant aggregates plus summarization calls,
     /// minus every attributed child block; `None` when the session recorded no billable work.
     pub usage: Option<crate::session_usage::SessionUsageSummary>,
@@ -38,31 +35,9 @@ pub struct SessionInfo {
     pub deleted_descendant_usage: Option<crate::session_usage::SessionUsageSummary>,
 }
 
-pub const SESSION_LIST_SEARCH_TEXT_MAX_CHARS: usize = 64 * 1024;
-
 /// The scan's read-buffer size: one 64 KiB fill reads the typical session in
 /// a single syscall; only the syscall chunking changes.
 const SESSION_SCAN_READ_BUF_BYTES: usize = 64 * 1024;
-
-/// Space-join the texts, cut the final addition at the cap. `used` is the
-/// corpus's char count before this append; the returned count is after it.
-pub(super) fn append_capped_search_text(current: &mut String, text: &str, used: usize) -> usize {
-    if text.is_empty() {
-        return used;
-    }
-    if used >= SESSION_LIST_SEARCH_TEXT_MAX_CHARS {
-        return used;
-    }
-    let mut count = used;
-    if count > 0 {
-        current.push(' ');
-        count += 1;
-    }
-    let remaining = SESSION_LIST_SEARCH_TEXT_MAX_CHARS - count;
-    let mut taken = 0;
-    current.extend(text.chars().take(remaining).inspect(|_| taken += 1));
-    count + taken
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct SessionInfoGeneration {
@@ -203,9 +178,8 @@ pub(super) const SESSION_SCAN_RESUME_TAIL_BYTES: usize = 16;
 /// Clone is the snapshot fold's copy (TS `snapshotSessionInfo`). Serialize is
 /// the persisted sidecar's form ([`super::info_sidecar`]): a released lease
 /// holder writes it, a cold process loads it and folds only the tail.
-/// Persisted in `<stem>.info-cache.json`: any change to this fold's semantics
-/// or fields must bump `info_sidecar::INFO_SIDECAR_VERSION`, or old sessions
-/// keep the old build's prefix fold.
+/// Persisted in `<stem>.info-cache.json`: see
+/// `info_sidecar::INFO_SIDECAR_VERSION` for the version-bump rule.
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(super) struct SessionScanAccumulator {
     header: Option<SessionHeader>,
@@ -215,10 +189,6 @@ pub(super) struct SessionScanAccumulator {
     thinking_level: Option<String>,
     pub(super) message_count: usize,
     pub(super) first_message: String,
-    pub(super) all_messages_text: String,
-    /// [`SessionScanAccumulator::all_messages_text`]'s char count, kept in
-    /// lockstep by the only writer (`append_capped_search_text`): avoids re-counting.
-    pub(super) search_text_chars: usize,
     last_activity_ms: Option<u64>,
     usage_scan: crate::session_usage::UsageScan,
 }
@@ -268,8 +238,6 @@ impl SessionScanState {
                 thinking_level: self.acc.thinking_level.clone(),
                 message_count: self.acc.message_count,
                 first_message: self.acc.first_message.clone(),
-                all_messages_text: self.acc.all_messages_text.clone(),
-                search_text_chars: self.acc.search_text_chars,
                 last_activity_ms: self.acc.last_activity_ms,
                 usage_scan: self.acc.usage_scan.clone(),
             },
@@ -397,9 +365,6 @@ pub(super) struct SessionInfoEntry<'a> {
     child_usage: Option<crate::session_usage::ScanUsage>,
     #[serde(default)]
     aggregate_usage: Option<crate::session_usage::ScanUsage>,
-    /// `compaction`/`branch_summary`: the summarization call's own usage.
-    #[serde(default)]
-    usage: Option<crate::session_usage::ScanUsage>,
 }
 
 /// Read a session file's list metadata: unchanged files answer from the cache,
@@ -407,12 +372,18 @@ pub(super) struct SessionInfoEntry<'a> {
 #[must_use]
 pub fn read_session_info(path: &Path) -> Option<SessionInfo> {
     let mut file = fs::File::open(path).ok()?;
-    read_session_info_from(&mut file, path)
+    read_session_info_from(&mut file, path).map(|(info, _)| info)
 }
 
 /// [`read_session_info`] over an already-open handle: the roster gate shares
 /// one open with the fold (the gate reads the first line, the fold rewinds).
-pub(crate) fn read_session_info_from(file: &mut fs::File, path: &Path) -> Option<SessionInfo> {
+/// The flag is true when no in-process state served and the persisted sidecar
+/// did not cover the whole file (absent, unloadable, or behind): the fold read
+/// bytes a sidecar would have spared.
+pub(crate) fn read_session_info_from(
+    file: &mut fs::File,
+    path: &Path,
+) -> Option<(SessionInfo, bool)> {
     let generation = SessionInfoGeneration::from_metadata(&file.metadata().ok()?);
 
     // The unchanged case answers from the cache; the grown case resumes.
@@ -422,7 +393,7 @@ pub(crate) fn read_session_info_from(file: &mut fs::File, path: &Path) -> Option
             Some(cached) if cached.generation == generation => {
                 let info = cached.info.clone();
                 cache.touch(path);
-                return info;
+                return info.map(|info| (info, false));
             }
             Some(cached)
                 if cached.same_file_identity(&generation)
@@ -431,7 +402,7 @@ pub(crate) fn read_session_info_from(file: &mut fs::File, path: &Path) -> Option
                 if cached.prefix_intact(file) {
                     Some(cached.clone_for_resume())
                 } else {
-                    Some(SessionScanState::fresh(generation))
+                    None
                 }
             }
             // No in-process state serves (absent or invalidated): the
@@ -440,8 +411,8 @@ pub(crate) fn read_session_info_from(file: &mut fs::File, path: &Path) -> Option
             _ => None,
         }
     };
-    let mut state = match state {
-        Some(state) => state,
+    let (mut state, sidecar_behind) = match state {
+        Some(state) => (state, false),
         None => {
             // A previous lease holder's certified fold state, loaded from
             // the sidecar. It passes the same validation ladder a cached
@@ -451,15 +422,15 @@ pub(crate) fn read_session_info_from(file: &mut fs::File, path: &Path) -> Option
             // intact prefix folds its appended entries, and anything
             // else is the cold scan the sidecar-less path always ran.
             match info_sidecar::load(path) {
-                Some(cached) if cached.generation == generation => cached,
+                Some(cached) if cached.generation == generation => (cached, false),
                 Some(cached)
                     if cached.same_file_identity(&generation)
                         && generation.len > cached.generation.len
                         && cached.prefix_intact(file) =>
                 {
-                    cached
+                    (cached, true)
                 }
-                _ => SessionScanState::fresh(generation),
+                _ => (SessionScanState::fresh(generation), true),
             }
         }
     };
@@ -500,7 +471,7 @@ pub(crate) fn read_session_info_from(file: &mut fs::File, path: &Path) -> Option
             cache.store_state(path, state);
         }
     }
-    Some(info)
+    Some((info, sidecar_behind))
 }
 
 impl SessionScanState {
@@ -588,7 +559,6 @@ impl SessionScanState {
             } else {
                 acc.first_message.clone()
             },
-            all_messages_text: acc.all_messages_text.clone(),
             usage,
             // Ledger-derived, never the file scan's: the listing arm attaches it from the ledger.
             deleted_descendant_usage: None,
@@ -677,10 +647,6 @@ pub(super) fn fold_scan_entry(acc: &mut SessionScanAccumulator, raw: &str) -> Op
                 entry.aggregate_usage.map(Usage::from),
             );
         }
-        "compaction" | "branch_summary" => {
-            acc.usage_scan
-                .fold_summarization(entry.usage.map(Usage::from));
-        }
         "message" => {
             acc.message_count += 1;
             if let Some(message) = entry.message {
@@ -701,25 +667,17 @@ pub(super) fn fold_scan_entry(acc: &mut SessionScanAccumulator, raw: &str) -> Op
                             Some(acc.last_activity_ms.unwrap_or(0).max(timestamp));
                     }
                 }
-                if (role == Some("user") && acc.first_message.is_empty())
-                    || (matches!(role, Some("user" | "assistant"))
-                        && acc.search_text_chars < SESSION_LIST_SEARCH_TEXT_MAX_CHARS)
-                {
+                if role == Some("user") && acc.first_message.is_empty() {
                     let text = message_content_text(message.content);
-                    if role == Some("user") && acc.first_message.is_empty() && !text.is_empty() {
+                    if !text.is_empty() {
                         acc.first_message.clone_from(&text);
-                    }
-                    if matches!(role, Some("user" | "assistant")) {
-                        acc.search_text_chars = append_capped_search_text(
-                            &mut acc.all_messages_text,
-                            &text,
-                            acc.search_text_chars,
-                        );
                     }
                 }
             }
         }
-        _ => {}
+        type_ => acc
+            .usage_scan
+            .fold_billed_row(crate::session_usage::billed_line(type_, trimmed)),
     }
     Some(())
 }
