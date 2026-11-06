@@ -420,7 +420,10 @@ pub fn ipython_tool_schema() -> serde_json::Value {
 }
 
 /// The largest per-call `timeout` the model may pass, in seconds.
-pub const PYTHON_REPL_TIMEOUT_MAX_S: u64 = 180;
+///
+/// Matches the default cell limit, so an explicit `timeout` can use the full
+/// safety window and cannot ask for a longer cell than that default.
+pub const PYTHON_REPL_TIMEOUT_MAX_S: u64 = DEFAULT_PYTHON_CELL_TIMEOUT_MS / 1000;
 
 /// The model's `timeout` argument as a cell limit in milliseconds, clamped to
 /// 1..=[`PYTHON_REPL_TIMEOUT_MAX_S`] seconds.
@@ -656,7 +659,7 @@ mod tests {
         assert_eq!(timeout_arg_ms(&json!({ "timeout": 5 })), Some(5_000));
         assert_eq!(timeout_arg_ms(&json!({ "timeout": 0 })), Some(1_000));
         assert_eq!(
-            timeout_arg_ms(&json!({ "timeout": 3600 })),
+            timeout_arg_ms(&json!({ "timeout": PYTHON_REPL_TIMEOUT_MAX_S + 1 })),
             Some(PYTHON_REPL_TIMEOUT_MAX_S * 1000)
         );
     }

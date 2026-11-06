@@ -254,8 +254,13 @@ pub struct TelemetrySettings {
     pub local_mirror: Option<bool>,
 }
 
-/// The default time limit for user `python_repl` cells: 60 seconds.
-pub const DEFAULT_PYTHON_CELL_TIMEOUT_MS: u64 = 60_000;
+/// The default time limit for user `python_repl` cells: 2 hours.
+///
+/// Factory plugin cells poll a child for the whole staged run inside one
+/// cell. The previous 60 second default interrupted those cells. Override
+/// with `pythonCellTimeoutMs`; `0` disables the limit. Daemonless sessions
+/// never arm it.
+pub const DEFAULT_PYTHON_CELL_TIMEOUT_MS: u64 = 7_200_000;
 
 /// The settings document: every known field optional; unknown keys preserved.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
