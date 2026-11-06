@@ -24,7 +24,7 @@ mod queue;
 pub use queue::Lane;
 pub use queue::QueuePriority;
 pub(crate) use queue::{
-    admit_autonomous_follow_up, admit_bash_completion_notice, admit_goal_follow_up,
+    admit_autonomous_follow_up, admit_goal_follow_up, admit_kernel_notice,
     checkpoint_queue_recovery, clear_withdrawn_progress_note, enqueue_priority,
     gather_delivery_batch, parse_custom_message, parse_prompt_images, queue_lanes,
     restore_queue_snapshot, restored_turn_policy, withdraw_bash_completion_notice, QueueCheckpoint,
@@ -40,8 +40,9 @@ use create::{active_session_id_of, worker_server_capabilities};
 // session_summary/SummaryInputs serve the in-crate test modules only, so allow the unused import.
 #[allow(unused_imports)]
 pub(crate) use summary::{
-    compact_action_label, emit_worker_event_with, persist_custom_row, push_roster_delta,
-    session_snapshot, session_summary, RosterPushContext, SummaryInputs,
+    broadcast_custom_row_locked, compact_action_label, emit_worker_event_locked,
+    emit_worker_event_with, persist_custom_row, push_roster_delta, session_snapshot,
+    session_summary, RosterPushContext, SummaryInputs,
 };
 use turn::TurnRunner;
 
@@ -295,6 +296,8 @@ impl Worker {
             created: false,
             attached_client_ids: Vec::new(),
             abort_requested: false,
+            turn_cancelled: false,
+            turn_completed: false,
             suppress_aborted_row: false,
             shutdown_requested: false,
             last_activity_ms: 0,
@@ -321,6 +324,7 @@ impl Worker {
             active_action: None,
             running_tool_calls: std::collections::HashSet::new(),
             running_admission_ids: std::collections::HashSet::new(),
+            tool_use_count: 0,
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
@@ -608,25 +612,25 @@ impl Worker {
                         );
                     });
                 concrete.set_compaction_summary_sink(summary_sink);
-                // The bash-completion wake seam (TS `_promptInjectedMessage`
-                // for `bash.completed`): the handler validates, the sink
-                // admits/withdraws through the queue lanes.
+                // The kernel-notice wake seam (TS `_promptInjectedMessage`
+                // for `bash.completed` and `factory.progress`): the handlers
+                // validate, the sinks admit/withdraw through the queue lanes.
                 let notice_engine = std::sync::Arc::downgrade(concrete);
                 let notice_core = Arc::clone(&core);
                 let notice_notify = Arc::clone(&work_notify);
                 let notice_recovery = Arc::clone(&recovery);
-                let completion: crate::engine::BashCompletionSink = Arc::new(move |notice| {
+                let notice_sink: crate::engine::KernelNoticeSink = Arc::new(move |notice| {
                     let Some(engine) = notice_engine.upgrade() else {
                         return;
                     };
                     if engine.session_is_closed() {
                         return;
                     }
-                    admit_bash_completion_notice(
+                    admit_kernel_notice(
                         &notice_recovery,
                         &notice_core,
                         &notice_notify,
-                        &notice,
+                        notice,
                         // Revalidated inside the admission's lock section: the
                         // close paths mark the session BEFORE clearing the lanes.
                         || engine.session_is_closed(),
@@ -644,7 +648,7 @@ impl Worker {
                         engine.as_deref().map(|engine| engine as &dyn SessionEngine),
                     );
                 });
-                concrete.set_bash_notice_sinks(completion, consumed);
+                concrete.set_kernel_notice_sinks(notice_sink, consumed);
                 // The accepted note frames as a session event on the pump.
                 let note_core = Arc::clone(&core);
                 let note_events = events.clone();
@@ -845,8 +849,8 @@ impl Worker {
     /// no destructors, so the caller must have settled the close first).
     async fn exit_after_close(&self) -> ! {
         // Shutdown keeps the resume entry and exits the process (TS
-        // `closeKeepsResumeEntry("shutdown")`).
-        let _ = self.record_recovery(false, "shutdown");
+        // `closeKeepsResumeEntry("shutdown")`); `handle_shutdown` already
+        // recorded the recovery verdict.
         self.close_listener_then_cleanup_socket().await;
         std::process::exit(0)
     }
@@ -858,7 +862,7 @@ impl Worker {
             "pa-daemon worker {}: registration refused (the supervisor no longer owns this identity); retiring",
             std::process::id()
         );
-        let _ = self.handle_shutdown().await;
+        let _ = self.handle_shutdown(&json!({})).await;
         self.exit_after_close().await;
     }
 }
@@ -920,8 +924,8 @@ fn emit_refinement_row(
     review_session_id: &str,
     message: &Value,
 ) -> bool {
+    let mut core = core.lock().unwrap();
     {
-        let mut core = core.lock().unwrap();
         let Some(store) = core.store.as_mut() else {
             return false;
         };
@@ -942,16 +946,7 @@ fn emit_refinement_row(
             }),
         );
     }
-    emit_worker_event_with(
-        core,
-        events,
-        json!({ "type": "message_start", "message": message }),
-    );
-    emit_worker_event_with(
-        core,
-        events,
-        json!({ "type": "message_end", "message": message }),
-    );
+    broadcast_custom_row_locked(&mut core, events, message);
     true
 }
 
@@ -1018,6 +1013,56 @@ impl pa_core::session_engine::rlm_usage::RlmChildUsageStore for CoreUsageStore {
             store
                 .append_child_usage_once(&row_id, &target_id, child_usage, origin)
                 .map_err(|error| std::io::Error::other(format!("{error:#}")))
+        })
+    }
+
+    /// The worker swaps `core.store` on a session replace, so a bill made
+    /// before the swap lands only if its session is still the open one
+    /// (the fence `emit_refinement_event_for_session` applies to events).
+    fn append_model_usage(
+        &self,
+        session_id: String,
+        usage: pa_core::session_engine::model_usage::ModelUsage,
+    ) -> pa_core::session_engine::rlm_usage::RlmChildUsageFuture<'_, std::io::Result<()>> {
+        let core = Arc::clone(&self.0);
+        Box::pin(async move {
+            let data = serde_json::to_value(&usage)?;
+            let mut core = core.lock().unwrap();
+            let Some(store) = core.store.as_mut() else {
+                return Err(std::io::Error::other("session store not created"));
+            };
+            // A pathless store's id is not the engine's (lifecycle.rs keeps the in-memory
+            // manager's own id), so only path-backed sessions are fenced.
+            if !store.path.as_os_str().is_empty() && store.session_id() != session_id {
+                return Err(std::io::Error::other(format!(
+                    "bill for session {session_id} dropped: the worker moved to session {}",
+                    store.session_id()
+                )));
+            }
+            store
+                .persist_entry(
+                    "custom",
+                    json!({
+                        "customType": pa_core::session_engine::model_usage::MODEL_USAGE_CUSTOM_TYPE,
+                        "data": data,
+                    }),
+                )
+                .map(|_| ())
+                .map_err(|error| std::io::Error::other(format!("{error:#}")))
+        })
+    }
+
+    /// The engine builds on the store a create or a replacement installed;
+    /// a replacement retires the engine, so the rebuild re-observes.
+    fn observe_billed_rows(
+        &self,
+        sink: pa_core::session::billed_row::BilledRowSink,
+    ) -> pa_core::session_engine::rlm_usage::RlmChildUsageFuture<'_, ()> {
+        let core = Arc::clone(&self.0);
+        Box::pin(async move {
+            if let Some(store) = core.lock().unwrap().store.as_mut() {
+                store.billed_row_sink = crate::session_store::BilledRowSinkSlot(Some(sink));
+            }
         })
     }
 }

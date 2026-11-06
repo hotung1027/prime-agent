@@ -22,6 +22,10 @@ pub(crate) struct SessionCore {
     pub(crate) created: bool,
     pub(crate) attached_client_ids: Vec<String>,
     pub(crate) abort_requested: bool,
+    /// Explicit cancellation of this picked delivery; graceful shutdown is excluded.
+    pub(crate) turn_cancelled: bool,
+    /// A successful terminal Done was observed for this picked delivery.
+    pub(crate) turn_completed: bool,
     /// A flow that detaches from the interrupted turn's events (a manual
     /// `compact`, a branch navigation) swallowed the aborted row in TS, so the
     /// gate's aborted-row exception stays closed while it settles its turn.
@@ -32,6 +36,11 @@ pub(crate) struct SessionCore {
     /// The turn's tool calls in flight, keyed by tool-call id: the
     /// roster summary derives `isRunningTools` from its size.
     pub(crate) running_tool_calls: std::collections::HashSet<String>,
+    /// The session's tool executions so far (the summary's `toolUseCount`):
+    /// bumped per `tool_execution_start` under the same core lock the frames
+    /// sequence under, and seeded from the session file when a worker opens
+    /// it, so a revived session never resets the count.
+    pub(crate) tool_use_count: u64,
     /// Admission ids belonging to the current in-flight turn. The queue
     /// handoff and owned cancellation both inspect this under the core lock.
     pub(crate) running_admission_ids: std::collections::HashSet<String>,
@@ -118,12 +127,15 @@ impl SessionCore {
             created: true,
             attached_client_ids: Vec::new(),
             abort_requested: false,
+            turn_cancelled: false,
+            turn_completed: false,
             suppress_aborted_row: false,
             shutdown_requested: false,
             last_activity_ms: 0,
             compacting: false,
             running_tool_calls: std::collections::HashSet::new(),
             running_admission_ids: std::collections::HashSet::new(),
+            tool_use_count: 0,
             auto_compaction_enabled: true,
             last_action_snapshot: Some(SessionActionSnapshot::default()),
             rlm_depth: 0,

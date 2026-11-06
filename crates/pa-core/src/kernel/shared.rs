@@ -9,6 +9,8 @@ use serde_json::Value;
 
 use crate::kernel::bootstrap::KernelPythonSkill;
 
+/// Per-cell stdout/stderr cap. `HeadTailBuffer` splits it between head and
+/// tail, so a long failing run keeps its printed verdict.
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 65_536;
 pub const HOST_REQUEST_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 pub const KERNEL_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
@@ -65,6 +67,18 @@ pub const AGENT_MESSAGE_DISPLAY_MIME: &str = "application/vnd.prime-agent.agent-
 pub const BASH_ACTIVITY_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-activity+json";
 /// One `bash()` call's command text (capped) and non-blank line count.
 pub const BASH_COMMAND_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-command+json";
+/// One `rlm.session.messages` read: `{returned, first, total, roles}`.
+pub const TRANSCRIPT_READ_DISPLAY_MIME: &str = "application/vnd.prime-agent.transcript-read+json";
+/// The kernel host request that reports a background bash completion
+/// (the `[bash-done]` lane). The daemon registers the handler
+/// (`bash_notices`), and the provisioner keys the bounded-await bootstrap
+/// default on its presence.
+pub const BASH_COMPLETED_REQUEST_TYPE: &str = "bash.completed";
+
+/// The kernel host request that ends the turn from inside a cell
+/// (`rlm.end_turn()`). The host-request dispatch answers it by marking
+/// the executing cell's result, so the turn ends once the batch settles.
+pub const END_TURN_REQUEST_TYPE: &str = "rlm.end_turn";
 
 pub const EXECUTE_STATUS_OK: &str = "ok";
 pub const EXECUTE_STATUS_ERROR: &str = "error";
@@ -199,11 +213,19 @@ pub struct ExecuteResult {
     pub sent_agent_messages: Option<Vec<KernelSentAgentMessage>>,
     /// The `bash()` commands this cell started, summarized for display.
     pub bash_commands: Option<KernelBashCommands>,
+    /// The cell's `rlm.session.messages` reads, one display record each.
+    pub transcript_reads: Option<Vec<Value>>,
     /// Output that arrived without this cell's id (user threads, other cells' leftovers, raw fd writes).
     pub background_output: Option<String>,
+    /// The cell called the sanctioned `rlm.end_turn()`: the host marked
+    /// this execution, and the turn ends once the batch settles.
+    pub ended_turn: bool,
     pub status: ExecuteStatus,
     pub error: Option<KernelError>,
     pub duration_ms: u64,
+    /// The [`ExecuteOptions::cell_timeout_ms`] limit that interrupted this
+    /// cell; `None` when the cell settled on its own or was aborted.
+    pub timed_out_after_ms: Option<u64>,
 }
 
 /// Options for one `execute` call.
@@ -221,6 +243,13 @@ pub struct ExecuteOptions {
     pub internal: bool,
     /// The protocol repair's own request; exempt from waiting on the repair it belongs to.
     pub protocol_repair: bool,
+    /// Per-cell time limit in milliseconds, measured from the request going on
+    /// the wire (queue wait and kernel boot excluded). A cell that outlives it
+    /// is interrupted exactly like an aborted one (interrupt, then force-abort
+    /// after the grace window), and its result carries
+    /// [`ExecuteResult::timed_out_after_ms`]. `None` and zero disable it; the
+    /// runtime bootstrap and state ops never arm it.
+    pub cell_timeout_ms: Option<u64>,
 }
 
 /// The error raised when a new cell cannot start because the previously

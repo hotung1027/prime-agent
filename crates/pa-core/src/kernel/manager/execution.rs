@@ -166,26 +166,10 @@ impl Inner {
                 self.register_late_sent_agent_message_handler(&execution.request_id, callback);
             }
 
-            let mut stdout = std::mem::take(&mut buffers.stdout);
-            buffers.stdout_chars = 0;
-            let mut stderr = std::mem::take(&mut buffers.stderr);
-            buffers.stderr_chars = 0;
+            let stdout = std::mem::take(&mut buffers.stdout).finish(execution.max_chars);
+            let stderr = std::mem::take(&mut buffers.stderr).finish(execution.max_chars);
             let mut result = buffers.result.take();
             let mut status = buffers.status;
-            if buffers.stdout_truncated {
-                let _ = write!(
-                    stdout,
-                    "\n[... output truncated at {} chars ...]",
-                    execution.max_chars
-                );
-            }
-            if buffers.stderr_truncated {
-                let _ = write!(
-                    stderr,
-                    "\n[... output truncated at {} chars ...]",
-                    execution.max_chars
-                );
-            }
             if let Some(text) = &result {
                 if let Some((end, _)) = text.char_indices().nth(execution.max_chars) {
                     // Match the Unicode-scalar limit used for stdout and stderr.
@@ -198,14 +182,19 @@ impl Inner {
                     result = Some(clipped);
                 }
             }
-            if execution
+            let user_aborted = execution
                 .opts
                 .signal
                 .as_ref()
-                .is_some_and(AbortSignal::is_aborted)
-            {
+                .is_some_and(AbortSignal::is_aborted);
+            if user_aborted {
                 status = ExecuteStatus::Aborted;
             }
+            // A user abort wins over the limit (plain Ctrl+C: no timeout text, no
+            // kill), and a cell that completed ok as its limit fired keeps its ok outcome.
+            let timed_out_after_ms = buffers
+                .timed_out_after_ms
+                .filter(|_| !user_aborted && status != ExecuteStatus::Ok);
 
             let mut background_output = std::mem::take(&mut buffers.background_output);
             buffers.background_output_chars = 0;
@@ -225,10 +214,14 @@ impl Inner {
                 sent_agent_messages: (!buffers.sent_agent_messages.is_empty())
                     .then(|| std::mem::take(&mut buffers.sent_agent_messages)),
                 bash_commands: buffers.bash_commands.take(),
+                transcript_reads: (!buffers.transcript_reads.is_empty())
+                    .then(|| std::mem::take(&mut buffers.transcript_reads)),
                 background_output: (!background_output.is_empty()).then_some(background_output),
+                ended_turn: buffers.ended_turn,
                 status,
                 error: buffers.error.take(),
                 duration_ms: execution.started.elapsed().as_millis() as u64,
+                timed_out_after_ms,
             };
             drop(buffers);
             if let Some(tx) = lock(&execution.result_tx).take() {

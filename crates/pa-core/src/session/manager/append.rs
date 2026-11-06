@@ -28,6 +28,11 @@ impl SessionManager {
             return Err(error);
         }
         let entry = self.file_entries[index].clone();
+        if let Some(sink) = &self.billed_row_sink {
+            if let Some(row) = crate::session::billed_row::billed_file_entry(&entry) {
+                sink(&row);
+            }
+        }
         if let Some(window) = &mut self.window {
             window.append_entry(entry.clone());
         }
@@ -157,6 +162,50 @@ impl SessionManager {
         let id = base.id.clone().unwrap_or_default();
         self.append_entry(FileEntry::ServiceTierChange {
             payload: pa_types::session::ServiceTierChangeEntry { service_tier },
+            base,
+        })?;
+        Ok(id)
+    }
+
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when the durable append fails.
+    pub fn append_tool_started(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> std::io::Result<String> {
+        let base = self.next_base();
+        let id = base.id.clone().unwrap_or_default();
+        self.append_entry(FileEntry::ToolStarted {
+            payload: pa_types::session::ToolStartedEntry {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                args,
+            },
+            base,
+        })?;
+        Ok(id)
+    }
+
+    /// # Errors
+    ///
+    /// Returns the underlying I/O error when the durable append fails.
+    pub fn append_tool_progress(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        elapsed_ms: u64,
+    ) -> std::io::Result<String> {
+        let base = self.next_base();
+        let id = base.id.clone().unwrap_or_default();
+        self.append_entry(FileEntry::ToolProgress {
+            payload: pa_types::session::ToolProgressEntry {
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                elapsed_ms,
+            },
             base,
         })?;
         Ok(id)

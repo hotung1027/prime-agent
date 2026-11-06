@@ -209,6 +209,7 @@ fn children(socket: &Path, agent_dir: &Path, script: &Path) -> SupervisorChildSe
             agent_dir.to_path_buf(),
             /*telemetry_disabled*/ true,
         )),
+        String::new(),
     );
     sessions.set_identity(ParentIdentity {
         rlm_depth: 0,
@@ -230,7 +231,9 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         name: Some(name.to_string()),
         model: None,
         thinking: None,
+        cwd: None,
         spawned_by_request_id: None,
+        factory: None,
     }
 }
 

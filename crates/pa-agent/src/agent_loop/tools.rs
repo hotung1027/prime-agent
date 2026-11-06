@@ -116,7 +116,8 @@ async fn execute_tool_calls_sequential(
                 is_error,
             },
             Preparation::Prepared(prepared) => {
-                let executed = execute_prepared_tool_call(&prepared, signal, emit).await;
+                let executed =
+                    execute_prepared_tool_call(&prepared, config.tool_progress, signal, emit).await;
                 finalize_executed_tool_call(
                     current_context,
                     assistant_message,
@@ -205,8 +206,13 @@ async fn execute_tool_calls_parallel(
                     args: prepared.args.clone(),
                 };
                 let handle = tokio::spawn(async move {
-                    let executed =
-                        execute_prepared_tool_call(&prepared, Some(&signal), &sink).await;
+                    let executed = execute_prepared_tool_call(
+                        &prepared,
+                        config.tool_progress,
+                        Some(&signal),
+                        &sink,
+                    )
+                    .await;
                     let finalized = finalize_executed_tool_call(
                         &context,
                         &assistant_message,
@@ -265,9 +271,13 @@ pub(crate) struct PreparedToolCall {
     pub(crate) args: serde_json::Value,
 }
 
+/// The batch terminate rule: ANY terminating result ends the turn, not
+/// every one. Models emit work calls and the sanctioned `rlm.end_turn()`
+/// in one message. Every call in the batch still executes before the turn
+/// ends.
 fn should_terminate_tool_batch(finalized_calls: &[FinalizedToolCallOutcome]) -> bool {
     !finalized_calls.is_empty()
         && finalized_calls
             .iter()
-            .all(|finalized| finalized.result.terminate == Some(true))
+            .any(|finalized| finalized.result.terminate == Some(true))
 }

@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 use crate::backpressure::RouteAdmission;
 use crate::protocol::{response_failure, response_success, DaemonResponse};
 use crate::registry::ResidentWorker;
-use crate::supervisor::Supervisor;
+use crate::supervisor::{RosterFamilySeedOwner, Supervisor};
 
 /// Worker round-trip budget for the sender-summary read and the delivery
 /// route (TS `WORKER_REQUEST_TIMEOUT_MS`).
@@ -216,24 +216,31 @@ impl Supervisor {
                 Err(error) => return WakeOutcome::Failed(error.to_string()),
             },
         };
-        let archive_dir = crate::session_archive::archive_dir(&self.options.agent_dir);
-        let info = match crate::session_catalog::resolve_saved_session(
-            &sessions_dir,
-            &archive_dir,
-            selector,
-            &cwd,
-        ) {
-            Ok(Some(info)) => info,
+        // The catalog scans and an archive restore's copy are blocking file I/O.
+        let archive_dir = self.options.agent_dir.join("sessions-archive");
+        let catalog_selector = selector.to_string();
+        let resolved = tokio::task::spawn_blocking(move || {
+            crate::session_catalog::resolve_saved_session(
+                &sessions_dir,
+                &archive_dir,
+                &catalog_selector,
+                &cwd,
+            )
+        })
+        .await;
+        let info = match resolved {
+            Ok(Ok(Some(info))) => info,
             // The saved-session catalog misses RLM children (they persist in
             // the parent's session-artifacts tree); the spawn ledger still
             // tracks them, so a child selector falls back to its live edges.
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 return match self.wake_ledger_child(selector).await {
                     Some(outcome) => outcome,
                     None => WakeOutcome::Unknown,
                 }
             }
-            Err(error) => return WakeOutcome::Failed(error.to_string()),
+            Ok(Err(error)) => return WakeOutcome::Failed(error.to_string()),
+            Err(error) => return WakeOutcome::Failed(format!("the saved-session lookup: {error}")),
         };
         let session_path = info.path.to_string_lossy().to_string();
         // Reuse before spawning (TS `createOrReuseWorker`): a resident
@@ -267,7 +274,11 @@ impl Supervisor {
         let launch = tokio::spawn({
             let supervisor = Arc::clone(self);
             let create = create;
-            async move { supervisor.launch_worker(&create, None).await }
+            async move {
+                supervisor
+                    .launch_worker(&create, None, RosterFamilySeedOwner::Registration)
+                    .await
+            }
         });
         let launched = tokio::time::timeout(
             std::time::Duration::from_millis(crate::supervisor::ROUTE_TIMEOUT_MS),
@@ -385,7 +396,11 @@ impl Supervisor {
         let launch = tokio::spawn({
             let supervisor = Arc::clone(self);
             let create = create;
-            async move { supervisor.launch_worker(&create, None).await }
+            async move {
+                supervisor
+                    .launch_worker(&create, None, RosterFamilySeedOwner::Registration)
+                    .await
+            }
         });
         let launched = tokio::time::timeout(
             std::time::Duration::from_millis(crate::supervisor::ROUTE_TIMEOUT_MS),
@@ -657,6 +672,8 @@ mod tests {
             name: "kid".to_string(),
             deleted: None,
             deleted_usage: None,
+            deleted_usage_by_model: None,
+            factory: None,
         };
         for selector in ["kid", "sub-kid1", "sess-kid"] {
             assert!(ledger_edge_matches(&edge, selector), "{selector}");

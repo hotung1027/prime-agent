@@ -56,6 +56,7 @@ impl AgentSessionEngine {
                 config.agent_dir.clone(),
                 link_config.active_session_id.clone(),
                 std::sync::Arc::clone(&model_refusal_telemetry),
+                link_config.worker_token.clone(),
             ))
         });
         let autonomous_driver = std::sync::RwLock::new(std::sync::Arc::new(
@@ -65,40 +66,39 @@ impl AgentSessionEngine {
         let cwd = std::sync::Arc::new(std::sync::RwLock::new(config.cwd.clone()));
         // The ACP MCP store (auth storage construction is blocking, off the hot async paths).
         let agent_dir = config.agent_dir.clone();
-        // Settings-declared user servers; re-read per resolve so `mcp.refresh` sees settings
-        // changes.
+        // Executable MCP settings and catalog sources are user/global only.
+        // Re-read per resolve so refresh sees user changes without project overrides.
         let mcp_cwd = std::sync::Arc::clone(&cwd);
         let mcp_agent_dir = agent_dir.clone();
         let catalog_cwd = std::sync::Arc::clone(&cwd);
         let catalog_agent_dir = agent_dir.clone();
+        let user_servers: pa_core::mcp::UserServersFn = std::sync::Arc::new(move || {
+            // The live cwd slot, not the construction-time cwd: the rebind must reach the MCP
+            // settings discovery.
+            let mcp_cwd = mcp_cwd.read().expect("engine cwd lock").clone();
+            let settings = pa_core::settings::SettingsManager::create(&mcp_cwd, &mcp_agent_dir);
+            Some(
+                settings
+                    .global_settings()
+                    .mcp_servers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(server, server_config)| {
+                        serde_json::from_value(server_config)
+                            .ok()
+                            .map(|parsed| (server, parsed))
+                    })
+                    .collect::<std::collections::HashMap<String, pa_core::mcp::McpServerConfig>>(),
+            )
+        });
+        let oauth_user_servers = std::sync::Arc::clone(&user_servers);
         let mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: pa_core::auth::AuthStorage::create_with_oauth(
                 &agent_dir,
-                std::sync::Arc::new(pa_core::mcp::McpOAuth::new()),
+                std::sync::Arc::new(pa_core::mcp::McpOAuth::new(oauth_user_servers)),
             ),
-            get_user_servers: Box::new(move || {
-                // The live cwd slot, not the construction-time cwd: the rebind must reach the MCP
-                // settings discovery.
-                let mcp_cwd = mcp_cwd.read().expect("engine cwd lock").clone();
-                let settings = pa_core::settings::SettingsManager::create(&mcp_cwd, &mcp_agent_dir);
-                Some(
-                    settings
-                        .settings()
-                        .mcp_servers
-                        .clone()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|(server, server_config)| {
-                            serde_json::from_value(server_config)
-                                .ok()
-                                .map(|parsed| (server, parsed))
-                        })
-                        .collect::<std::collections::HashMap<
-                            String,
-                            pa_core::mcp::McpServerConfig,
-                        >>(),
-                )
-            }),
+            get_user_servers: Box::new(move || user_servers()),
             begin_login: None,
             agent_dir: Some(agent_dir),
             get_catalog_sources: Some(Box::new(move || {
@@ -107,7 +107,7 @@ impl AgentSessionEngine {
                 let settings =
                     pa_core::settings::SettingsManager::create(&catalog_cwd, &catalog_agent_dir);
                 settings
-                    .settings()
+                    .global_settings()
                     .mcp_catalog_sources
                     .clone()
                     .unwrap_or_default()
@@ -137,7 +137,7 @@ impl AgentSessionEngine {
             goal_budget_crossed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             goal_input_probe: std::sync::Mutex::new(None),
             goal_admission_sink: std::sync::Mutex::new(None),
-            bash_completion_sink: std::sync::Mutex::new(None),
+            kernel_notice_sink: std::sync::Mutex::new(None),
             bash_consumed_sink: std::sync::Mutex::new(None),
             goal_queue_purge: std::sync::Mutex::new(None),
             goal_backoff_wake_job_id: std::sync::Mutex::new(None),
@@ -187,6 +187,7 @@ impl AgentSessionEngine {
             autonomous_queue_purge: std::sync::Mutex::new(None),
             cwd,
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
+            factory_child: std::sync::atomic::AtomicBool::new(false),
             rlm_max_depth_source: std::sync::Mutex::new("default"),
             pending_max_depth: std::sync::Mutex::new(None),
             reloaded_goal_update: std::sync::Mutex::new(None),
@@ -949,7 +950,7 @@ impl AgentSessionEngine {
         let mut handlers = HostRequestHandlers::default();
         register_agent_message_host_handlers(sender, &mut handlers);
         register_agent_observe_host_handlers(observer, &mut handlers);
-        self.register_bash_notice_host_handlers(&mut handlers);
+        self.register_kernel_notice_host_handlers(&mut handlers);
         Some(handlers)
     }
 
@@ -1053,7 +1054,7 @@ impl AgentSessionEngine {
         // The engine session stays non-persisted (the worker owns the
         // durable file); the configured session dir leads, the file's
         // parent is the fallback.
-        let session_manager = match self
+        let mut session_manager = match self
             .config
             .session_dir
             .as_deref()
@@ -1067,6 +1068,19 @@ impl AgentSessionEngine {
             }
             None => pa_core::session::manager::SessionManager::in_memory(&cwd),
         };
+        // The in-memory manager takes the durable file's header id, as TS's engine opened the
+        // durable file: provider requests key prompt caching, Codex socket reuse, and session
+        // headers on it, so it must survive a resume in a new worker, a replacement build, and
+        // a daemon restart. A pathless session keeps the manager's own id.
+        if let Some(header) = session_file
+            .as_deref()
+            .and_then(pa_core::session::manager::read_session_header)
+        {
+            session_manager.new_session(&pa_core::session::manager::NewSessionOptions {
+                id: Some(header.id),
+                ..Default::default()
+            });
+        }
         if let Some(children) = &self.children {
             children.set_model(format!("{}/{}", model.provider, model.id));
         }
@@ -1168,12 +1182,16 @@ impl AgentSessionEngine {
             rlm_usage_store,
             progress_note_emit,
             rlm_depth: Some(self.rlm_depth.load(std::sync::atomic::Ordering::Relaxed)),
+            factory_child: self
+                .factory_child
+                .load(std::sync::atomic::Ordering::Relaxed),
             // The worker session runs under the daemon scheduler and its wake-ups.
             daemonless: false,
             model_info: Some(model.clone()),
             // Prewarm; the depth gate keeps subagent workers lazy.
             prewarm_ipython_kernel: Some(true),
             on_background_work_settled,
+            bash_notice_wake: None,
             // The worker-installed purge withdraws queued minted continuations.
             queued_goal_context_purge,
             // The steering lane owns the stop hooks (a queued steer cuts the next turn).
