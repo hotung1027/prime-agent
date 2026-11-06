@@ -1216,38 +1216,26 @@ class ReplTest(unittest.TestCase):
         inspected = self.repl.execute("bash-inspect", "handle.poll().output")
         self.assertIn("detached", one(inspected, "result")["text"])
 
-    def test_degraded_await_in_creating_cell_still_sends_bash_completion(self):
-        # A bounded await that degrades inside the creating cell must count as
-        # neither awaited nor consumed, or the [bash-done] notice (the only
-        # wake-up) would never fire.
+    def test_await_longer_than_one_second_returns_exit_code(self):
+        # Notices wired is the daemon case. The await must block past the old
+        # 1 second snapshot and come back with the process status, not a
+        # still-running handle that would also fire bash.completed.
         code = "\n".join(
             [
                 "import rlm",
                 "rlm._set_completion_notices_wired(True)",
                 "from rlm import bash",
-                "handle = bash('sleep 1.5; printf degraded')",
-                "await handle",
-                "handle.pid",
+                "result = await bash('sleep 1.5; printf waited; exit 3')",
+                "(result.exit_code, result.running, result.output)",
             ]
         )
-        events = self.repl.execute("bash-degrade", code)
-        pid = int(one(events, "result")["text"])
-        request = wait_for_host_request(self.repl, events)
-        self.assertEqual(
-            request["data"],
-            {
-                "type": "bash.completed",
-                "pid": pid,
-                "command": "sleep 1.5; printf degraded",
-                "exitCode": 0,
-            },
-        )
-        reply_ok(self.repl, request)
+        events = self.repl.execute("bash-await-exit", code)
+        self.assertIsNone(one(events, "host_request"))
+        self.assertEqual(one(events, "result")["text"], "(3, False, 'waited')")
 
-    def test_degraded_await_of_a_persistent_shell_keeps_it_running_to_its_notice(self):
-        # The yield window and persistent= compose: the persistent handle's await
-        # degrades like any handle's, and the shell (never owned by an await)
-        # runs on to its [bash-done] notice.
+    def test_await_of_a_persistent_shell_returns_exit_code(self):
+        # persistent= does not shorten the await: a command longer than the old
+        # 1 second window still returns its exit status.
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         repl = ReplProcess(
@@ -1260,25 +1248,13 @@ class ReplTest(unittest.TestCase):
                 "import rlm",
                 "rlm._set_completion_notices_wired(True)",
                 "from rlm import bash",
-                "handle = bash('sleep 1.5; printf persisted', persistent=True)",
-                "snapshot = await handle",
-                "(snapshot.running, snapshot.handle is handle, handle.pid)",
+                "result = await bash('sleep 1.5; printf persisted', persistent=True)",
+                "(result.exit_code, result.output)",
             ]
         )
-        events = repl.execute("persistent-degrade", code)
-        running, same, pid = one(events, "result")["text"].strip("()").split(", ")
-        self.assertEqual((running, same), ("True", "True"))
-        request = wait_for_host_request(repl, events)
-        self.assertEqual(
-            request["data"],
-            {
-                "type": "bash.completed",
-                "pid": int(pid),
-                "command": "sleep 1.5; printf persisted",
-                "exitCode": 0,
-            },
-        )
-        reply_ok(repl, request)
+        events = repl.execute("persistent-await-exit", code)
+        self.assertIsNone(one(events, "host_request"))
+        self.assertEqual(one(events, "result")["text"], "(0, 'persisted')")
 
     def test_result_read_after_notice_requests_one_withdrawal(self):
         reads = (

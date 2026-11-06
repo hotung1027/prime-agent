@@ -1380,15 +1380,27 @@ class BashTest(unittest.IsolatedAsyncioTestCase):
 
 
 class BoundedAwaitTest(unittest.IsolatedAsyncioTestCase):
-    """The yield-window contract: with completion notices wired (the kernel
-    bootstrap call) an await degrades to the live handle past the window;
-    without them every await stays unbounded (nothing wakes a collector)."""
+    """Await returns a finished result even when completion notices are wired.
+
+    A positive `_YIELD_AFTER_SECONDS` still degrades to a snapshot; production
+    leaves that window unset."""
 
     def _wire_notices(self) -> None:
         bash_module._set_completion_notices_wired(True)
         self.addCleanup(bash_module._set_completion_notices_wired, False)
         bash_module._degrade_hints_written = 0
         self.addCleanup(setattr, bash_module, "_degrade_hints_written", 0)
+
+    async def test_wired_await_returns_exit_code_past_one_second(self):
+        # The old default returned a snapshot at 1s with exit_code still None.
+        # A command that outlives that window must still finish the await.
+        self._wire_notices()
+        handle = bash("sleep 1.3; exit 3")
+        result = await handle
+        self.assertIsInstance(result, bash_module.BashResult)
+        self.assertEqual(result.exit_code, 3)
+        self.assertIs(result.running, False)
+        self.assertEqual(handle.exit_code, 3)
 
     @mock.patch.object(bash_module, "_YIELD_AFTER_SECONDS", 0.3)
     async def test_bounded_await_degrades_to_a_snapshot(self):

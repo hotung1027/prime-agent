@@ -1,15 +1,12 @@
-//! Bounded bash await, headless e2e: a `python_repl` tool call that does a
-//! blocking `await bash(...)` keeps the turn moving instead of wedging it,
-//! with NO override — the kernel bootstrap's default wiring (the
-//! bash.completed host handler flips the runtime's bounded default on) is
-//! the thing under test.
+//! Awaited bash, headless e2e: a `python_repl` tool call that does
+//! `await bash(...)` does not return until the command's exit status is
+//! known. The kernel bootstrap still wires `bash.completed`; that must not
+//! turn the await into a 1 second snapshot with `exit_code` unset.
 //!
 //! The mock provider scripts the turn: request 1 calls `python_repl` with a
-//! one-shot `await bash('sleep 5; echo ...')`. The await degrades at the
-//! 1s window: the tool result carries the still-running handle, and the
-//! turn settles while the command keeps running. Its `[bash-done ...]`
-//! notice then wakes the idle session. Everything is asserted by transcript
-//! event ORDER, not wall-clock caps.
+//! one-shot `await bash('sleep 5; echo ...')`. The tool result carries the
+//! finished `BashResult` (exit code 0 and the command output), and only then
+//! does the turn settle.
 
 // 64-bit-only targets; the narrowing casts sit at bounded OS boundaries.
 #![allow(
@@ -128,8 +125,7 @@ fn serve(mut stream: TcpStream, next: &AtomicUsize) -> std::io::Result<()> {
         reader.read_exact(&mut body)?;
     }
     // The scripted sequence: request 1 answers the python_repl tool call that
-    // runs the bounded one-shot await, request 2 ends the turn, every later
-    // request the woken reply.
+    // awaits a 5 second command to completion, request 2 ends the turn.
     let request = next.fetch_add(1, Ordering::SeqCst);
     let mut payload = String::new();
     let data = match request {
@@ -251,17 +247,6 @@ impl Client {
     }
 }
 
-fn wait_until<T>(deadline: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + deadline;
-    loop {
-        if let Some(value) = probe() {
-            return value;
-        }
-        assert!(Instant::now() < deadline, "condition never became true");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 #[allow(clippy::zombie_processes)]
 fn spawn_daemon(socket: &Path, agent_dir: &Path, kernel_python: Option<&Path>) -> Daemon {
     std::fs::create_dir_all(agent_dir).expect("agent dir");
@@ -302,7 +287,7 @@ fn spawn_daemon(socket: &Path, agent_dir: &Path, kernel_python: Option<&Path>) -
 }
 
 #[test]
-fn a_bounded_bash_await_degrades_and_the_notice_wakes_the_session() {
+fn an_awaited_bash_command_finishes_with_exit_code_before_the_turn_ends() {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let Some(kernel_python) = kernel_python() else {
         return;
@@ -361,9 +346,8 @@ fn a_bounded_bash_await_degrades_and_the_notice_wakes_the_session() {
         .expect("active session id")
         .to_string();
 
-    // THE TURN: the tool call awaits a 5s command; the
-    // default wiring must degrade the await and settle the turn while the
-    // command is still running.
+    // THE TURN: the tool call awaits a 5s command. The result must include
+    // the exit status; the turn settles only after that command finishes.
     let turn = client.request(
         "p1",
         &json!({
@@ -374,54 +358,31 @@ fn a_bounded_bash_await_degrades_and_the_notice_wakes_the_session() {
     );
     assert_eq!(turn["success"], true, "turn failed: {turn}");
 
-    // Event ORDER, part 1 — the tool result shows the RUNNING snapshot (the
-    // degrade hint rides the same stderr lane) and the turn settled before
-    // the command finished: no completed-result repr anywhere yet.
+    // The tool result shows the finished command (exit code and output), and
+    // that result precedes the turn's closing reply. A 1 second snapshot
+    // would have rendered `<BashSnapshot` and omitted the echo.
     let after_turn = client.messages(&active_id);
-    let snapshot = after_turn
-        .find("<BashSnapshot running pid=")
-        .expect("the tool result never showed the running snapshot");
+    let finished = after_turn
+        .find("BashResult(exit_code=0")
+        .expect("the tool result never showed a finished exit code");
+    assert!(
+        after_turn.contains("BOUNDED_AWAIT_E2E_DONE"),
+        "the command output never reached the tool result: {after_turn}"
+    );
+    assert!(
+        !after_turn.contains("<BashSnapshot"),
+        "the await returned before the command finished: {after_turn}"
+    );
     let turn_end = after_turn
         .find("turn complete")
         .expect("the follow-up assistant reply never landed");
     assert!(
-        snapshot < turn_end,
-        "the running-snapshot tool result must precede the turn's end: {after_turn}"
+        finished < turn_end,
+        "the finished bash result must precede the turn's end: {after_turn}"
     );
-    assert!(
-        !after_turn.contains("BashResult("),
-        "the await blocked to completion instead of degrading: {after_turn}"
-    );
-    assert!(
-        after_turn.contains("still running after"),
-        "the budgeted degrade hint never reached the tool result: {after_turn}"
-    );
-
-    // Event ORDER, part 2 — the command finishes past the turn, and its
-    // notice wakes the idle session: the woken reply can only follow the
-    // [bash-done] row that caused it.
-    let settled = wait_until(Duration::from_mins(1), || {
-        let messages = client.messages(&active_id);
-        (messages.contains("[bash-done pid:") && messages.contains("exit:0")).then_some(messages)
-    });
-    let notice = settled
-        .find("[bash-done pid:")
-        .expect("the bash-done notice never landed");
-    assert!(
-        notice > turn_end,
-        "the notice must land after the turn settled, not inside it: {settled}"
-    );
-    // The wake itself: the woken reply can only exist after the notice.
-    wait_until(Duration::from_mins(1), || {
-        let messages = client.messages(&active_id);
-        let woken_after_notice = messages
-            .find("woken by the bash-done notice")
-            .is_some_and(|at| at > notice);
-        woken_after_notice.then_some(messages)
-    });
 
     // Teardown: stop the session through the live supervisor so the worker
-    // (and its kernel + the 5s sleeper) do not leak past the test.
+    // and its kernel do not leak past the test.
     client.request(
         "k1",
         &json!({ "type": "kill", "activeSessionId": active_id }),

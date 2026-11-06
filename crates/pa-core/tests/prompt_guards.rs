@@ -565,10 +565,9 @@ fn bundled_skills_match_the_ts_packaged_set() {
     );
 }
 
-/// The bounded-await contract renders wherever the Python REPL does: every session kind, daemon
-/// or daemonless, registers the bash completion notice the degrade relies on.
+/// `await bash()` returns a finished result wherever the Python REPL does.
 #[test]
-fn bounded_await_contract_renders_in_daemon_and_daemonless_sessions() {
+fn bash_await_contract_renders_in_daemon_and_daemonless_sessions() {
     let mut options = BuildSystemPromptOptions {
         cwd: "/w".to_string(),
         messages_path: Some("/log.jsonl".to_string()),
@@ -580,9 +579,8 @@ fn bounded_await_contract_renders_in_daemon_and_daemonless_sessions() {
         options.daemonless = daemonless;
         let prompt = system_prompt_breakdown(&options).assembled;
         assert!(
-            prompt.contains("`r.running` is True")
-                && prompt.contains("`r.exit_code` is None"),
-            "daemonless={daemonless}: the prompt must carry the bounded-await result contract: {prompt}"
+            prompt.contains("integer `r.exit_code`"),
+            "daemonless={daemonless}: the prompt must say await returns an exit code: {prompt}"
         );
     }
 }

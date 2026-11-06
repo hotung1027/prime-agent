@@ -121,9 +121,9 @@ async def fire(event, ctx, cfg, log):
             if kind == "shell":
                 command = _render(action["command"], ctx)
                 handle = bash(command)
-                await handle
+                result = await handle
                 results.append({"event": event, "type": "shell", "command": command,
-                                "exit": handle.exit_code, "output": handle.output()[-500:]})
+                                "exit": result.exit_code, "output": result.output[-500:]})
             elif kind == "mcp":
                 args = _render(action.get("arguments") or {}, ctx)
                 reply = await rlm.mcp.call_tool(action["server"], action["tool"], args)

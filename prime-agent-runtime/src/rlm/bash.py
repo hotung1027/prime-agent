@@ -57,13 +57,13 @@ _ASYNCIO_WRAPPER_CALLBACKS = {
     ("asyncio.tasks", "_release_waiter"),
 }
 
-# Bounded awaits: in sessions whose host registers the bash.completed handler,
-# an await still running after _YIELD_AFTER_SECONDS degrades to returning the
-# live handle instead of blocking (the [bash-done] notice collects it). The
-# kernel bootstrap flips the flag from the host-handler registry — one source
-# of truth; the window stays here, never on the Rust side.
+# Await returns when the exit status is written. `_YIELD_AFTER_SECONDS` is
+# None in production: a daemon session used to return a still-running snapshot
+# after 1 second, with `exit_code` still None. A positive number is that
+# snapshot window, used by tests. The kernel bootstrap still records whether
+# `bash.completed` is wired; that flag only selects the snapshot path.
 _completion_notices_wired = False
-_YIELD_AFTER_SECONDS = 1.0
+_YIELD_AFTER_SECONDS: float | None = None
 
 
 def _set_completion_notices_wired(wired: bool) -> None:
@@ -512,6 +512,17 @@ class BashHandle:
         # keep foreground result semantics after `cmd &` returns early.
         self._released = True
         return not self._reaped
+
+    @property
+    def exit_code(self) -> int | None:
+        """Process status once the command has finished; None while it is running.
+
+        Set before an await of this handle returns. Reading it does not release
+        the handle or count as consuming the result.
+        """
+        with self._callback_lock:
+            result = self._result
+        return None if result is None else result.exit_code
 
     def output(self) -> str:
         self._released = True
@@ -1050,8 +1061,8 @@ class BashHandle:
     def __await__(self) -> Generator[Any, None, BashResult | BashSnapshot]:
         # A handle awaited before any other API use is a one-shot command tied
         # to the await (kill-on-cancel); touching the handle API first marks it
-        # as a deliberate background handle whose awaits only wait. Both paths
-        # wait at most the yield window, then degrade to this live handle.
+        # as a deliberate background handle whose awaits only wait. With no
+        # yield window the await returns only after the exit status is known.
         try:
             current_task = asyncio.current_task()
         except RuntimeError:
@@ -1299,15 +1310,13 @@ def bash(command: str, persistent: bool = False) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
-    kills the command's process group. In sessions whose host wires completion
-    notices (the kernel bootstrap turns the bound on), an await that is still
-    running after 1 second instead DEGRADES: it returns a BashSnapshot
-    (r.running True, r.output the output so far, r.handle the live handle)
-    while the command keeps running, and its [bash-done] notification arrives
-    on completion. In sessions without completion notices every await stays
-    unbounded. `h = bash(cmd)` used as a background handle (any
-    .pid/.running/.output()/.tail()/.poll()/.kill() access before the first
-    await) survives cancellation; awaiting it only waits. Leak
+    kills the command's process group. The await returns a BashResult only
+    after the command finishes: `r.exit_code` is the process status and
+    `r.running` is False. A handle that is not awaited keeps running, and its
+    [bash-done] notification arrives on completion. `h = bash(cmd)` used as a
+    background handle (any .pid/.running/.output()/.tail()/.poll()/.kill()
+    access before the first await) survives cancellation; awaiting it only
+    waits. Leak
     containment is per-platform: process groups plus the orphan journal on
     POSIX; a kill-on-close job object on Windows entered while the child is
     still suspended, so no descendant can escape it and kill()/crash cleanup
@@ -1321,8 +1330,9 @@ def bash(command: str, persistent: bool = False) -> BashHandle:
     shell survives kernel, worker, and daemon restarts and its session's
     delete or archive (a deleted session's shells keep running as orphans);
     only its own exit or an explicit kill() ends it. Its output and exit
-    status live in files under the agent dir, and awaits never own it: a
-    bounded await degrades as for any handle and the shell runs on. After a
+    status live in files under the agent dir, and awaits never own it:
+    cancelling an await leaves the shell running, and the await itself
+    returns only after the shell records an exit status. After a
     restart, get the handles back with `from rlm import persistent_shells;
     persistent_shells()`; a shell that finished while no
     kernel ran is listed once, finished. Completion of a re-attached shell is
